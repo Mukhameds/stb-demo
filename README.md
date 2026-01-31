@@ -104,4 +104,4 @@ It is a small proof-of-mechanism that points toward:
 * Purpose: demonstration and discussion
 * Scaling and architecture work are intentionally out of scope here
 
-```
+
