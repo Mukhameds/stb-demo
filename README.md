@@ -1,6 +1,6 @@
 
 
-````
+
 # STB Demo — stb-demo-v1
 
 This repository contains a minimal, runnable demonstration of the STB (Signal–Block) paradigm.
@@ -41,7 +41,7 @@ Nothing is optimized end-to-end.
 
 Requirements:
 - Go 1.20+
-
+````
 ```bash
 go run main.go
 ````
