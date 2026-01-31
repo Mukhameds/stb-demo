@@ -42,7 +42,6 @@ Nothing is optimized end-to-end.
 Requirements:
 - Go 1.20+
 ````
-```bash
 go run main.go
 ````
 
