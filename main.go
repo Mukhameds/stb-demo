@@ -741,54 +741,117 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	clearFloatMap(ctx.ThisStructMass)
 	clearStringMap(ctx.ThisExpect)
 
-	// --- Prediction error check: compare incoming sensory token against expectations from previous tick
+	// --- Prediction error check (CAUSAL CLEAN PATCH v2, no new Context fields) ---
+	// Evaluate error ONLY if previous tick actually had expectations.
+	// We use existing ctx.PendingExpect as the "armed" indicator.
 	errSignals := make([]Signal, 0, 4)
-	for _, s := range incoming {
-		if s.Kind != K_SENS {
-			continue
-		}
-		actual := s.Value
 
-		for st, pred := range ctx.PendingExpect {
-			if pred == "" {
-				continue
+	armed := len(ctx.PendingExpect) > 0
+	if armed {
+		// pick first sensory token in this tick
+		actual := ""
+		for _, s := range incoming {
+			if s.Kind == K_SENS {
+				actual = s.Value
+				break
 			}
-			if pred != actual {
-				// avoid spamming repeated errors for the same struct
-				if ctx.ErrCooldown[st] > 0 {
+		}
+
+		if actual != "" {
+			for st, pred := range ctx.PendingExpect {
+				if pred == "" {
 					continue
 				}
+				if pred != actual {
+					// avoid spamming repeated errors for the same struct
+					if ctx.ErrCooldown[st] > 0 {
+						continue
+					}
 
-				// If the model already predicts the actual token, don't emit an error.
-				if best := ctx.BestPred[st]; best != "" && best == actual {
-					// also gently relieve inhibition when we're correct
-					if v := ctx.Inhib[st]; v > 0 {
-						ctx.Inhib[st] = v * 0.5
-						if ctx.Inhib[st] < 0.02 {
-							delete(ctx.Inhib, st)
+					// If the model already predicts the actual token, don't emit an error.
+					if best := ctx.BestPred[st]; best != "" && best == actual {
+						// also gently relieve inhibition when we're correct
+						if v := ctx.Inhib[st]; v > 0 {
+							ctx.Inhib[st] = v * 0.5
+							if ctx.Inhib[st] < 0.02 {
+								delete(ctx.Inhib, st)
+							}
+						}
+						continue
+					}
+
+					// start cooldown on first visible error
+					ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
+
+					// emit error signal
+					ev := fmt.Sprintf("%s:%s->%s", st, pred, actual)
+					errSignals = append(errSignals, Signal{
+						Kind:  K_ERR,
+						Value: ev,
+						Mass:  1.0,
+						Time:  ctx.Tick,
+						From:  "FIELD:PRED",
+					})
+
+					// boost learning for a short window (only impacts TRAIN plasticity)
+					ctx.ErrTTL = 6
+
+					// inhibit the mispredicting struct a bit (competition/suppression)
+					ctx.Inhib[st] += 0.9
+
+					// --- error-correct the transition model in TRAIN mode ---
+					if ctx.LearningEnabled {
+						// ensure map exists
+						if _, ok := ctx.TransCounts[st]; !ok {
+							ctx.TransCounts[st] = make(map[string]float64)
+						}
+
+						oldPred := ctx.BestPred[st]
+						oldConf := ctx.PredConf[st]
+
+						// penalty: dampen the wrong predicted transition
+						if w, ok := ctx.TransCounts[st][pred]; ok {
+							ctx.TransCounts[st][pred] = w * 0.35
+							if ctx.TransCounts[st][pred] < 0.05 {
+								delete(ctx.TransCounts[st], pred)
+							}
+						}
+
+						// bonus: reinforce the actual transition (stronger under error context)
+						boost := 1.0
+						if ctx.ErrGain > 0 {
+							boost = 1.0 + ctx.ErrGain
+						}
+						ctx.TransCounts[st][actual] += 1.10 * boost
+
+						// recompute best prediction + confidence for st
+						bestTok := ""
+						bestV := -1.0
+						sumV := 0.0
+						for tok, v := range ctx.TransCounts[st] {
+							sumV += v
+							if v > bestV {
+								bestV = v
+								bestTok = tok
+							}
+						}
+						if bestTok != "" {
+							ctx.BestPred[st] = bestTok
+							if sumV > 0 {
+								ctx.PredConf[st] = bestV / sumV
+							} else {
+								ctx.PredConf[st] = 0
+							}
+						}
+
+						// optional: show a clear event in demo/logs when prediction flips due to error
+						if showPredEvents && ctx.BestPred[st] != "" &&
+							(ctx.BestPred[st] != oldPred || (ctx.PredConf[st]-oldConf) > 0.15) {
+							fmt.Printf("+++ PREDICTION UPDATED (error-correct): %s -> %s (conf=%.2f)\n",
+								st, ctx.BestPred[st], ctx.PredConf[st])
 						}
 					}
-					continue
 				}
-
-				// start cooldown on first visible error
-				ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
-
-				// emit error signal
-				ev := fmt.Sprintf("%s:%s->%s", st, pred, actual)
-				errSignals = append(errSignals, Signal{
-					Kind:  K_ERR,
-					Value: ev,
-					Mass:  1.0,
-					Time:  ctx.Tick,
-					From:  "FIELD:PRED",
-				})
-
-				// boost learning for a short window (only impacts TRAIN plasticity)
-				ctx.ErrTTL = 6
-
-				// inhibit the mispredicting struct a bit (competition/suppression)
-				ctx.Inhib[st] += 0.9
 			}
 		}
 	}
@@ -816,24 +879,20 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	queue = append(queue, emitted...)
 
 	// ---- emit weak PRED signals into the field (always-on expectations) ----
-	// IMPORTANT: field dynamics live in the local queue. So we append weak predictions into queue.
 	for st, tok := range ctx.BestPred {
 		conf := ctx.PredConf[st]
 		if tok == "" || conf < 0.25 {
-			continue // too weak to matter
+			continue
 		}
 
-		// weak predictive signal: keep same "STRUCT->TOKEN" formatting as main PRED
 		ps := Signal{
 			Kind:  K_PRED,
 			Value: fmt.Sprintf("%s->%s", st, tok),
-			Mass:  0.25 * conf, // deliberately weak
+			Mass:  0.25 * conf,
 			Time:  ctx.Tick,
 			From:  "FIELD:MODEL_WEAK",
 		}
 
-		// IMPORTANT: do NOT call applyInhibition here.
-		// It will be applied once inside the rounds loop (single consistent field rule).
 		if ps.Mass > 0.05 {
 			queue = append(queue, ps)
 		}
@@ -849,10 +908,8 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 
 		nextQueue := make([]Signal, 0, 256)
 		for _, raw := range queue {
-			// field inhibition applies to ACT/STRUCT (and energy budget inside applyInhibition)
 			s := applyInhibition(ctx, raw)
 
-			// record windows for downstream blocks
 			if s.Kind == K_ACT {
 				ctx.RecentActs = append(ctx.RecentActs, s)
 			}
@@ -862,13 +919,10 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				ctx.ThisStructSet[s.Value] = true
 				ctx.ThisStructMass[s.Value] += s.Mass
 
-				// if structure is strongly inhibited, freeze its prediction temporarily
 				if ctx.Inhib[s.Value] > 0.7 {
-					// do not emit/store prediction while it's suppressed
 					continue
 				}
 
-				// if we have a prediction for this struct, emit it as a signal and store expectation for next tick
 				if pred := ctx.BestPred[s.Value]; pred != "" {
 					ctx.ThisExpect[s.Value] = pred
 					nextQueue = append(nextQueue, Signal{
@@ -880,7 +934,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 					})
 				}
 
-				// mark the producing block as alive (forgetting uses this)
 				ctx.BlockLastFire[s.From] = ctx.Tick
 			}
 
@@ -888,7 +941,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				ctx.BlockLastFire[s.From] = ctx.Tick
 			}
 
-			// broadcast to all blocks
 			for _, id := range ctx.Order {
 				out := ctx.Blocks[id].React(s, ctx)
 				if len(out) > 0 {
@@ -902,8 +954,7 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		queue = nextQueue
 	}
 
-	// Step 2.5: Competition (inhibition) among simultaneously active STRUCTs.
-	// Winner stays; losers get inhibited for upcoming ticks.
+	// Step 2.5: Competition (inhibition)
 	if len(ctx.ThisStructMass) > 1 {
 		winner, wMass, ok := argmaxMap(ctx.ThisStructMass)
 		if ok && winner != "" {
@@ -911,8 +962,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				if st == winner {
 					continue
 				}
-
-				// inhibit weaker structures more strongly when gap is big
 				delta := wMass - mass
 				add := 0.7
 				if delta > 0.5 {
@@ -948,7 +997,7 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		ctx.PrevStructSet[k] = true
 	}
 
-	// Step 4: forgetting / pruning (in both modes)
+	// Step 4: forgetting / pruning
 	if ctx.PruneEvery > 0 && (ctx.Tick%ctx.PruneEvery == 0) {
 		pruneOldBlocks(ctx)
 	}
@@ -959,10 +1008,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	return allOut
 }
 
-// ---- Plasticity (clean): learn only adjacent pairs + struct(prevTick)->token
-// + NEW: error-driven learning boost (ErrTTL)
-// + NEW: prediction-model learning (struct -> next token transition counts)
-// ----
 
 func Plasticity(ctx *Context) {
 	boost := 1.0
@@ -1085,7 +1130,7 @@ func Plasticity(ctx *Context) {
 
 				if showPredEvents {
 					fmt.Printf(
-						"+++ EMERGENT EXPECTATION: %s ⇒ %s (stability=%.2f)\n",
+						"+++ PREDICTION UPDATED: %s -> %s (conf=%.2f)\n",
 						st,
 						ctx.BestPred[st],
 						ctx.PredConf[st],
@@ -1309,11 +1354,293 @@ func parseErrTriplet(ev string) (st, pred, actual string, ok bool) {
 	return st, pred, actual, true
 }
 
+type EpisodeReport struct {
+	Structs  []string
+	Actions  []string
+	Errs     []string
+}
+
+func RunEpisodeLine(ctx *Context, line string, investorMode bool, demoRunning bool, sleepMs int, autoBoard bool) EpisodeReport {
+	resetEpisodeBoundary(ctx)
+	tokens := strings.Fields(strings.TrimSpace(line))
+	return RunEpisodeTokens(ctx, tokens, investorMode, demoRunning, sleepMs, autoBoard)
+}
+
+// Единственная “честная трасса” обработки — используется и demo, и обычным вводом
+func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunning bool, sleepMs int, autoBoard bool) EpisodeReport {
+	episodeStructs := make([]string, 0, 32)
+	episodeActions := make([]string, 0, 32)
+	episodeErrs := make([]string, 0, 32)
+
+	for _, tok := range tokens {
+		// AUTO-SEED SENSOR IF NEEDED
+		if !ctx.Sensors[tok] {
+			ctx.AddBlock(&SensorBlock{token: tok})
+			ctx.Sensors[tok] = true
+
+			if ctx.LearningEnabled {
+				fmt.Printf("+++ AUTO-SENSOR CREATED [%s]\n", tok)
+			} else {
+				fmt.Printf("+++ TOKEN REGISTERED [%s] (test mode; no learning)\n", tok)
+			}
+		}
+
+		inSig := Signal{Kind: K_SENS, Value: tok, Mass: 1.0, Time: ctx.Tick, From: "USER"}
+
+		// snapshot BEFORE RunTick (so we can show Δconfidence on error)
+		oldConf := make(map[string]float64, len(ctx.PendingExpect))
+		oldBest := make(map[string]string, len(ctx.PendingExpect))
+		for st := range ctx.PendingExpect {
+			oldConf[st] = ctx.PredConf[st]
+			oldBest[st] = ctx.BestPred[st]
+		}
+
+		// --- MASS ACCUMULATION SNAPSHOT (for CHARGE prints) ---
+		oldLast := ctx.LastSens
+
+		oldPair := 0.0
+		oldSeq := 0.0
+		pairName := ""
+		seqName := ""
+		pairK := ""
+		seqK := ""
+
+		if oldLast != "" && oldLast != tok {
+			pairK = pairKey(oldLast, tok)
+			oldPair = ctx.SeenPairs[pairK]
+			pairName = canonicalPairName(oldLast, tok)
+
+			seqK = oldLast + ">" + tok
+			oldSeq = ctx.SeenSeq[seqK]
+			seqName = fmt.Sprintf("(%s>%s)", oldLast, tok)
+		}
+
+		// Compose snapshots (if previous tick had structs)
+		oldCompose := make(map[string]float64, 4)
+		composeName := make(map[string]string, 4)
+		if len(ctx.PrevStructSet) > 0 {
+			for base := range ctx.PrevStructSet {
+				a, b, ok := parsePairMembers(base)
+				if !ok {
+					continue
+				}
+				if tok == a || tok == b {
+					continue
+				}
+				ck := base + "||" + tok
+				oldCompose[ck] = ctx.SeenComposes[ck]
+				composeName[ck] = fmt.Sprintf("[%s-%s]", base, tok)
+			}
+		}
+
+		// Prediction transition snapshots (struct -> tok)
+		oldTrans := make(map[string]float64, 4)
+		if len(ctx.PrevStructSet) > 0 {
+			for st := range ctx.PrevStructSet {
+				if m, ok := ctx.TransCounts[st]; ok {
+					oldTrans[st] = m[tok]
+				} else {
+					oldTrans[st] = 0
+				}
+			}
+		}
+
+		out := RunTick(ctx, []Signal{inSig})
+
+		actions := make([]string, 0, 8)
+		structs := make([]string, 0, 8)
+		errs := make([]string, 0, 8)
+
+		for _, s := range out {
+			if s.Kind == K_ACTION {
+				actions = append(actions, s.Value)
+				episodeActions = append(episodeActions, s.Value)
+			}
+			if s.Kind == K_STRUCT {
+				structs = append(structs, s.Value)
+				episodeStructs = append(episodeStructs, s.Value)
+			}
+			if s.Kind == K_ERR {
+				errs = append(errs, s.Value)
+				episodeErrs = append(episodeErrs, s.Value)
+			}
+		}
+
+		// --- Build CHARGE lines ---
+		chargeLines := make([]string, 0, 8)
+
+		if pairK != "" {
+			now := ctx.SeenPairs[pairK]
+			if now > oldPair {
+				chargeLines = append(chargeLines,
+					fmt.Sprintf("CHARGE PAIR %s  mass=%.2f/1.00 (+%.2f)", pairName, now, now-oldPair),
+				)
+				if now >= 0.85 && now < 1.0 {
+					chargeLines = append(chargeLines,
+						fmt.Sprintf("NEAR-CRYSTAL %s (next repeat likely forms a block)", pairName),
+					)
+				}
+			}
+		}
+		if seqK != "" {
+			now := ctx.SeenSeq[seqK]
+			if now > oldSeq {
+				chargeLines = append(chargeLines,
+					fmt.Sprintf("CHARGE SEQ  %s  mass=%.2f/1.00 (+%.2f)", seqName, now, now-oldSeq),
+				)
+				if now >= 0.85 && now < 1.0 {
+					chargeLines = append(chargeLines, fmt.Sprintf("NEAR-CRYSTAL %s", seqName))
+				}
+			}
+		}
+		for ck, oldV := range oldCompose {
+			now := ctx.SeenComposes[ck]
+			if now > oldV {
+				nm := composeName[ck]
+				chargeLines = append(chargeLines,
+					fmt.Sprintf("CHARGE COMP %s  mass=%.2f/1.00 (+%.2f)", nm, now, now-oldV),
+				)
+				if now >= 0.85 && now < 1.0 {
+					chargeLines = append(chargeLines, fmt.Sprintf("NEAR-CRYSTAL %s", nm))
+				}
+			}
+		}
+		for st, oldW := range oldTrans {
+			nowW := 0.0
+			if m, ok := ctx.TransCounts[st]; ok {
+				nowW = m[tok]
+			}
+			if nowW > oldW {
+				chargeLines = append(chargeLines,
+					fmt.Sprintf("CHARGE PRED %s -> %s  w=%.2f (+%.2f)", st, tok, nowW, nowW-oldW),
+				)
+			}
+		}
+
+		// ---- printing (kept identical to current behavior) ----
+		if investorMode {
+			if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) == 0 {
+				if sleepMs > 0 {
+					time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+				}
+				continue
+			}
+			if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) > 0 {
+				fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
+				for _, ln := range chargeLines {
+					fmt.Printf("           %s\n", ln)
+				}
+				fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
+				continue
+			}
+		}
+
+		if len(structs) > 0 {
+			fmt.Printf("t=%03d INPUT=%s  STRUCT=%v\n", ctx.Tick, tok, structs)
+		} else {
+			fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
+		}
+
+		if !investorMode && len(chargeLines) > 0 {
+			for _, ln := range chargeLines {
+				fmt.Printf("           %s\n", ln)
+			}
+		}
+
+		// demo hides actions cosmetically (как у тебя сейчас)
+		if len(actions) > 0 && !(investorMode && demoRunning) {
+			fmt.Printf("           ACTION=%v\n", actions)
+		}
+		if len(errs) > 0 {
+			fmt.Printf("           ERROR=%v\n", errs)
+		}
+
+		// expectation detail (kept, we’ll rename strings in step #2)
+		suppressed := make(map[string]bool, 8)
+
+		if investorMode && len(errs) > 0 {
+			uniq := make(map[string]bool, 8)
+			parts := make([]string, 0, 8)
+
+			for _, ev := range errs {
+				st, pred, _, ok := parseErrTriplet(ev)
+				if !ok || uniq[st] {
+					continue
+				}
+				uniq[st] = true
+
+				showPred := pred
+				if b := oldBest[st]; b != "" {
+					showPred = b
+				}
+				conf := oldConf[st]
+				parts = append(parts, fmt.Sprintf("%s⇒%s(conf=%.2f)", st, showPred, conf))
+			}
+
+			if len(parts) > 0 {
+				fmt.Printf("           EXPECTATIONS: %s\n", strings.Join(parts, " ; "))
+			}
+		}
+
+		for _, ev := range errs {
+			st, pred, actual, ok := parseErrTriplet(ev)
+			if !ok {
+				continue
+			}
+			if ctx.Inhib[st] > 0.0 {
+				suppressed[st] = true
+			}
+
+			before := oldConf[st]
+			after := ctx.PredConf[st]
+
+			showPred := pred
+			if b := oldBest[st]; b != "" {
+				showPred = b
+			}
+
+			if ctx.LearningEnabled {
+				fmt.Printf("           MISPREDICTION: %s expected %s (conf %.2f) ⇒ got %s (conf %.2f->%.2f)\n",
+					st, showPred, before, actual, before, after)
+			} else {
+				fmt.Printf("           MISPREDICTION: %s expected %s (conf %.2f) ⇒ got %s\n",
+					st, showPred, before, actual)
+			}
+		}
+
+		if investorMode && len(errs) > 0 {
+			inhibN := len(suppressed)
+			if inhibN == 0 {
+				inhibN = len(errs)
+			}
+			fmt.Printf("           FIELD ADAPTATION: inhibited=%d | error-boost ttl=%d gain=%.2f\n",
+				inhibN, ctx.ErrTTL, ctx.ErrGain)
+		}
+
+		if len(structs) > 0 || len(actions) > 0 || len(errs) > 0 {
+			fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
+		}
+
+		if sleepMs > 0 {
+			time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+		}
+
+		if autoBoard {
+			printBoard(ctx, episodeStructs, episodeActions, episodeErrs)
+		}
+	}
+
+	return EpisodeReport{Structs: episodeStructs, Actions: episodeActions, Errs: episodeErrs}
+}
+
+
 // ---- main ----
 
 func main() {
 	ctx := NewContext()
-	sleepMs := 12 // demo pacing; set 0 for max speed
+
+	// Runtime knobs
+	sleepMs := 12   // demo pacing; set 0 for max speed
 	autoBoard := true
 	investorMode := false // concise logs, no autoBoard
 
@@ -1321,7 +1648,7 @@ func main() {
 	demoRunning := false
 
 	fmt.Println("STB DEMO (INHIB+PRED+ERROR+FORGET): signals -> blocks -> competition -> prediction -> error-driven learning -> forgetting.")
-	fmt.Println("Commands: train | test | reset | board | quit")
+	fmt.Println("Commands: train | test | reset | board | demo | quit")
 	fmt.Println("Suggested demo:")
 	fmt.Println("  train  ; reset ; repeat: 1 2 3   (3-5 times)")
 	fmt.Println("  test   ; reset ; try:    1 2 4   (watch PRED and ERR + inhibition)")
@@ -1333,6 +1660,9 @@ func main() {
 	lastEpisodeStructs := []string{}
 	lastEpisodeActions := []string{}
 	lastEpisodeErrs := []string{}
+
+	// "board" should show the last context that actually ran (interactive ctx or demoCtx)
+	lastBoardCtx := ctx
 
 	for {
 		fmt.Print("> ")
@@ -1347,50 +1677,70 @@ func main() {
 		switch strings.ToLower(line) {
 		case "quit", "exit":
 			return
+
 		case "train":
 			ctx.LearningEnabled = true
 			fmt.Println("MODE = TRAIN (learning enabled)")
 			continue
+
 		case "test":
 			ctx.LearningEnabled = false
 			fmt.Println("MODE = TEST (learning disabled)")
 			continue
+
 		case "reset":
 			resetEpisodeBoundary(ctx)
+			// also clear last episode buffers (so board doesn't show stale episode lines)
+			lastEpisodeStructs = nil
+			lastEpisodeActions = nil
+			lastEpisodeErrs = nil
 			fmt.Println("Reset episode boundary")
 			continue
+
 		case "board":
-			printBoard(ctx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
+			printBoard(lastBoardCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
 			continue
+
 		case "autoboard on":
 			autoBoard = true
 			fmt.Println("Auto board = ON")
 			continue
+
 		case "autoboard off":
 			autoBoard = false
 			fmt.Println("Auto board = OFF")
 			continue
+
 		case "investor on":
 			investorMode = true
 			autoBoard = false
 			sleepMs = 0
 			fmt.Println("Investor mode = ON (concise event log, autoboard off, no sleep)")
 			continue
+
 		case "investor off":
 			investorMode = false
 			fmt.Println("Investor mode = OFF")
 			continue
+
 		case "predlog on":
 			showPredEvents = true
 			fmt.Println("Pred event log = ON")
 			continue
+
 		case "predlog off":
 			showPredEvents = false
 			fmt.Println("Pred event log = OFF")
 			continue
 
-		// --- C) DEMO SCRIPT ---
+		// --- DEMO SCRIPT ---
 		case "demo":
+			// Save user's current CLI toggles (demo must not mess up normal use)
+			prevInvestorMode := investorMode
+			prevAutoBoard := autoBoard
+			prevSleepMs := sleepMs
+			prevDemoRunning := demoRunning
+
 			// Presentation setup (cosmetic only)
 			demoRunning = true
 			investorMode = true
@@ -1398,633 +1748,65 @@ func main() {
 			sleepMs = 0
 			fmt.Println("Demo: investor mode ON, running scripted sequence...")
 
-			// Local helper: run exactly like normal input processing (same logic, no model changes).
-			runLine := func(line string) {
-				// Each line is a separate episode boundary (same as normal)
-				resetEpisodeBoundary(ctx)
+			// IMPORTANT: run demo on a clean isolated context (deterministic)
+			demoCtx := NewContext()
+			demoCtx.LearningEnabled = true
 
-				episodeStructs := make([]string, 0, 32)
-				episodeActions := make([]string, 0, 32)
-				episodeErrs := make([]string, 0, 32)
+			// reset last episode buffers for board prints inside demo
+			lastEpisodeStructs = nil
+			lastEpisodeActions = nil
+			lastEpisodeErrs = nil
 
-				tokens := strings.Fields(line)
-				for _, tok := range tokens {
-					// AUTO-SEED SENSOR IF NEEDED
-					if !ctx.Sensors[tok] {
-						ctx.AddBlock(&SensorBlock{token: tok})
-						ctx.Sensors[tok] = true
-						// B) neutral message in TEST
-						if ctx.LearningEnabled {
-							fmt.Printf("+++ AUTO-SENSOR CREATED [%s]\n", tok)
-						} else {
-							fmt.Printf("+++ NEW TOKEN REGISTERED [%s] (no learning)\n", tok)
-						}
-					}
+			fmt.Println("DEMO STEP 1/3: ACCUMULATION -> CRYSTALLIZATION")
+			rep := RunEpisodeLine(demoCtx, "1 2 3 1 2 3 1 2 3 1 2 3", investorMode, demoRunning, sleepMs, false)
+			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
+			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
+			lastBoardCtx = demoCtx
 
-					inSig := Signal{Kind: K_SENS, Value: tok, Mass: 1.0, Time: ctx.Tick, From: "USER"}
+			// Explain why structures are not shown in Step 1
+			fmt.Println("NOTE: Step 1 reports accumulation and block crystallization (new blocks). STRUCT signals appear in Step 2.")
 
-					// snapshot BEFORE RunTick (so we can show Δconfidence on error)
-					oldConf := make(map[string]float64, len(ctx.PendingExpect))
-					oldBest := make(map[string]string, len(ctx.PendingExpect))
-					for st := range ctx.PendingExpect {
-						oldConf[st] = ctx.PredConf[st]
-						oldBest[st] = ctx.BestPred[st]
-					}
+			fmt.Println("DEMO STEP 2/3: STRUCTURES -> PREDICTION")
+			rep = RunEpisodeLine(demoCtx, "1 2 3 1 2 3 1 2 3 1 2 3", investorMode, demoRunning, sleepMs, false)
+			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
+			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
+			lastBoardCtx = demoCtx
 
-					// --- MASS ACCUMULATION SNAPSHOT (for CHARGE prints) ---
-					oldLast := ctx.LastSens // what was last token before this input
+			// --- PATCH #2: keep TRAIN in Step 3 so error-boost is not "fake"
+			// and so the system can actually adapt after misprediction.
+			demoCtx.LearningEnabled = true
+			fmt.Println("DEMO STEP 3/3: MISPREDICTION -> INHIBITION + ERROR-BOOST -> FAST RE-LEARN")
+			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
+			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
 
-					oldPair := 0.0
-					oldSeq := 0.0
-					pairName := ""
-					seqName := ""
-					pairK := ""
-					seqK := ""
+			// run again to show inhibition/error-boost effect persists and adaptation begins
+			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
+			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
 
-					if oldLast != "" && oldLast != tok {
-						pairK = pairKey(oldLast, tok)
-						oldPair = ctx.SeenPairs[pairK]
-						pairName = canonicalPairName(oldLast, tok) // like [1-2]
-
-						seqK = oldLast + ">" + tok
-						oldSeq = ctx.SeenSeq[seqK]
-						seqName = fmt.Sprintf("(%s>%s)", oldLast, tok)
-					}
-
-					// Compose snapshots (if previous tick had structs)
-					oldCompose := make(map[string]float64, 4) // key -> old mass
-					composeName := make(map[string]string, 4) // key -> pretty name
-					if len(ctx.PrevStructSet) > 0 {
-						for base := range ctx.PrevStructSet {
-							a, b, ok := parsePairMembers(base)
-							if !ok {
-								continue
-							}
-							if tok == a || tok == b {
-								continue // same rule as Plasticity
-							}
-
-							ck := base + "||" + tok
-							oldCompose[ck] = ctx.SeenComposes[ck]
-							composeName[ck] = fmt.Sprintf("[%s-%s]", base, tok) // e.g. [[1-2]-3]
-						}
-					}
-
-					// Prediction transition snapshots (struct -> tok)
-					oldTrans := make(map[string]float64, 4) // st -> old weight for this tok
-					if len(ctx.PrevStructSet) > 0 {
-						for st := range ctx.PrevStructSet {
-							if m, ok := ctx.TransCounts[st]; ok {
-								oldTrans[st] = m[tok]
-							} else {
-								oldTrans[st] = 0
-							}
-						}
-					}
-
-					out := RunTick(ctx, []Signal{inSig})
-
-					actions := make([]string, 0, 8)
-					structs := make([]string, 0, 8)
-					errs := make([]string, 0, 8)
-
-					for _, s := range out {
-						if s.Kind == K_ACTION {
-							actions = append(actions, s.Value)
-							episodeActions = append(episodeActions, s.Value)
-						}
-						if s.Kind == K_STRUCT {
-							structs = append(structs, s.Value)
-							episodeStructs = append(episodeStructs, s.Value)
-						}
-						if s.Kind == K_ERR {
-							errs = append(errs, s.Value)
-							episodeErrs = append(episodeErrs, s.Value)
-						}
-					}
-
-					// --- Build CHARGE lines (accumulation visibility) ---
-					chargeLines := make([]string, 0, 8)
-
-					if pairK != "" {
-						now := ctx.SeenPairs[pairK]
-						if now > oldPair {
-							chargeLines = append(chargeLines,
-								fmt.Sprintf("CHARGE PAIR %s  mass=%.2f/1.00 (+%.2f)", pairName, now, now-oldPair),
-							)
-							if now >= 0.85 && now < 1.0 {
-								chargeLines = append(chargeLines,
-									fmt.Sprintf("NEAR-CRYSTAL %s (next repeat likely forms a block)", pairName),
-								)
-							}
-						}
-					}
-					if seqK != "" {
-						now := ctx.SeenSeq[seqK]
-						if now > oldSeq {
-							chargeLines = append(chargeLines,
-								fmt.Sprintf("CHARGE SEQ  %s  mass=%.2f/1.00 (+%.2f)", seqName, now, now-oldSeq),
-							)
-							if now >= 0.85 && now < 1.0 {
-								chargeLines = append(chargeLines,
-									fmt.Sprintf("NEAR-CRYSTAL %s", seqName),
-								)
-							}
-						}
-					}
-					for ck, oldV := range oldCompose {
-						now := ctx.SeenComposes[ck]
-						if now > oldV {
-							nm := composeName[ck]
-							chargeLines = append(chargeLines,
-								fmt.Sprintf("CHARGE COMP %s  mass=%.2f/1.00 (+%.2f)", nm, now, now-oldV),
-							)
-							if now >= 0.85 && now < 1.0 {
-								chargeLines = append(chargeLines,
-									fmt.Sprintf("NEAR-CRYSTAL %s", nm),
-								)
-							}
-						}
-					}
-					for st, oldW := range oldTrans {
-						nowW := 0.0
-						if m, ok := ctx.TransCounts[st]; ok {
-							nowW = m[tok]
-						}
-						if nowW > oldW {
-							chargeLines = append(chargeLines,
-								fmt.Sprintf("CHARGE PRED %s -> %s  w=%.2f (+%.2f)", st, tok, nowW, nowW-oldW),
-							)
-						}
-					}
-
-					// --- INVESTOR MODE printing rules ---
-					if investorMode {
-						if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) == 0 {
-							// silent tick
-							continue
-						}
-
-						if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) > 0 {
-							fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
-							for _, ln := range chargeLines {
-								fmt.Printf("           %s\n", ln)
-							}
-							fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
-
-							lastEpisodeStructs = episodeStructs
-							lastEpisodeActions = episodeActions
-							lastEpisodeErrs = episodeErrs
-							continue
-						}
-					}
-
-					// normal print (or investor event tick)
-					if len(structs) > 0 {
-						fmt.Printf("t=%03d INPUT=%s  STRUCT=%v\n", ctx.Tick, tok, structs)
-					} else {
-						fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
-					}
-
-					if !investorMode && len(chargeLines) > 0 {
-						for _, ln := range chargeLines {
-							fmt.Printf("           %s\n", ln)
-						}
-					}
-
-					// Cosmetic: during demo, hide action lines (actions still exist; only output is hidden)
-					if len(actions) > 0 && !(investorMode && demoRunning) {
-						fmt.Printf("           ACTION=%v\n", actions)
-					}
-					if len(errs) > 0 {
-						// render collapse with STB arrow (keep internal "->" for parsing/logic)
-						derrs := make([]string, 0, len(errs))
-						for _, ev := range errs {
-							derrs = append(derrs, strings.ReplaceAll(ev, "->", "⇒"))
-						}
-						fmt.Printf("           COLLAPSE=%v\n", derrs)
-					}
-
-					// collect inhibited hypotheses for a summary line (unique structs from this error burst)
-					suppressed := make(map[string]bool, 8)
-
-					// Cosmetic: one short "expected" line before detailed EXPECT prints
-					if investorMode && len(errs) > 0 {
-						uniq := make(map[string]bool, 8)
-						parts := make([]string, 0, 8)
-
-						for _, ev := range errs {
-							st, pred, _, ok := parseErrTriplet(ev)
-							if !ok || uniq[st] {
-								continue
-							}
-							uniq[st] = true
-
-							showPred := pred
-							if b := oldBest[st]; b != "" {
-								showPred = b
-							}
-							conf := oldConf[st]
-							parts = append(parts, fmt.Sprintf("%s⇒%s(stability=%.2f)", st, showPred, conf))
-						}
-
-						if len(parts) > 0 {
-							fmt.Printf("           EMERGENT EXPECTATIONS: %s\n", strings.Join(parts, " ; "))
-						}
-					}
-
-					for _, ev := range errs {
-						st, pred, actual, ok := parseErrTriplet(ev)
-						if !ok {
-							continue
-						}
-
-						if ctx.Inhib[st] > 0.0 {
-							suppressed[st] = true
-						}
-
-						// confidence delta (old -> new)
-						before := oldConf[st]
-						after := ctx.PredConf[st]
-
-						// if oldBest is empty, fall back to pred from the event
-						showPred := pred
-						if b := oldBest[st]; b != "" {
-							showPred = b
-						}
-
-						if ctx.LearningEnabled {
-							fmt.Printf("           EXPECTATION COLLAPSE: %s expected %s (stability %.2f) ⇒ got %s -> UPDATED (stability %.2f->%.2f)\n",
-								st, showPred, before, actual, before, after)
-						} else {
-							fmt.Printf("           EXPECTATION COLLAPSE: %s expected %s (stability %.2f) ⇒ got %s\n",
-								st, showPred, before, actual)
-						}
-
-					}
-
-					// A) investor summary line after error burst
-					if investorMode && len(errs) > 0 {
-						inhibN := len(suppressed)
-						if inhibN == 0 {
-							inhibN = len(errs) // fallback
-						}
-						fmt.Printf("           FIELD RESPONSE: inhibition=%d hypotheses | error-context ttl=%d gain=%.2f\n",
-							inhibN, ctx.ErrTTL, ctx.ErrGain)
-
-					}
-
-					// --- show energy "at the moment" of activity ---
-					if len(structs) > 0 || len(actions) > 0 || len(errs) > 0 {
-						fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
-					}
-
-					// Save last episode for "board" command
-					lastEpisodeStructs = episodeStructs
-					lastEpisodeActions = episodeActions
-					lastEpisodeErrs = episodeErrs
-				}
-
-				// Save last episode for "board" command (end of line)
-				lastEpisodeStructs = episodeStructs
-				lastEpisodeActions = episodeActions
-				lastEpisodeErrs = episodeErrs
-			}
-
-			// --- demo sequence ---
-			ctx.LearningEnabled = true
-			fmt.Println("PHASE 1/3: ACCUMULATION -> CRYSTALLIZATION")
-			runLine("1 2 3 1 2 3 1 2 3 1 2 3")
-
-			fmt.Println("PHASE 2/3: STRUCTURES -> PREDICTIONS")
-			runLine("1 2 3 1 2 3 1 2 3 1 2 3")
-			printBoard(ctx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
-
-			ctx.LearningEnabled = false
-			fmt.Println("PHASE 3/3: EXPECTATION COLLAPSE -> INHIBITION (ERROR-CONTEXT)")
-			runLine("1 2 4")
-			runLine("1 2 4")
-			printBoard(ctx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
+			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs)
+			lastBoardCtx = demoCtx
 
 			// Cosmetic: final one-shot summary (no logic change; counts from existing blocks)
-			pairs := countBlocksByPrefix(ctx, "COACT:")
-			comps := countBlocksByPrefix(ctx, "COMPOSE:")
-			acts := countBlocksByPrefix(ctx, "ACTIONBLOCK:")
+			pairs := countBlocksByPrefix(demoCtx, "COACT:")
+			comps := countBlocksByPrefix(demoCtx, "COMPOSE:")
+			acts := countBlocksByPrefix(demoCtx, "ACTIONBLOCK:")
 
 			fmt.Printf("DEMO SUMMARY: learned pairs=%d | composes=%d | actionLinks=%d | blocks=%d\n",
-				pairs, comps, acts, len(ctx.Blocks))
+				pairs, comps, acts, len(demoCtx.Blocks))
 
-			// keep investorMode ON after demo (intentional), but stop hiding action lines outside demo
-			demoRunning = false
+			// Restore user's CLI toggles
+			investorMode = prevInvestorMode
+			autoBoard = prevAutoBoard
+			sleepMs = prevSleepMs
+			demoRunning = prevDemoRunning
+
 			continue
 		}
 
-		// Each user line is a separate episode boundary (prevents cross-line adjacency learning + prediction leakage)
-		resetEpisodeBoundary(ctx)
-
-		episodeStructs := make([]string, 0, 32)
-		episodeActions := make([]string, 0, 32)
-		episodeErrs := make([]string, 0, 32)
-
-		tokens := strings.Fields(line)
-		for _, tok := range tokens {
-			// AUTO-SEED SENSOR IF NEEDED
-			if !ctx.Sensors[tok] {
-				ctx.AddBlock(&SensorBlock{token: tok})
-				ctx.Sensors[tok] = true
-
-				// B) neutral message in TEST
-				if ctx.LearningEnabled {
-					fmt.Printf("+++ AUTO-SENSOR CREATED [%s]\n", tok)
-				} else {
-					fmt.Printf("+++ NEW TOKEN REGISTERED [%s] (no learning)\n", tok)
-				}
-			}
-
-			inSig := Signal{Kind: K_SENS, Value: tok, Mass: 1.0, Time: ctx.Tick, From: "USER"}
-
-			// snapshot BEFORE RunTick (so we can show Δconfidence on error)
-			oldConf := make(map[string]float64, len(ctx.PendingExpect))
-			oldBest := make(map[string]string, len(ctx.PendingExpect))
-			for st := range ctx.PendingExpect {
-				oldConf[st] = ctx.PredConf[st]
-				oldBest[st] = ctx.BestPred[st]
-			}
-
-			// --- MASS ACCUMULATION SNAPSHOT (for CHARGE prints) ---
-			oldLast := ctx.LastSens // what was last token before this input
-
-			oldPair := 0.0
-			oldSeq := 0.0
-			pairName := ""
-			seqName := ""
-			pairK := ""
-			seqK := ""
-
-			if oldLast != "" && oldLast != tok {
-				pairK = pairKey(oldLast, tok)
-				oldPair = ctx.SeenPairs[pairK]
-				pairName = canonicalPairName(oldLast, tok) // like [1-2]
-
-				seqK = oldLast + ">" + tok
-				oldSeq = ctx.SeenSeq[seqK]
-				seqName = fmt.Sprintf("(%s>%s)", oldLast, tok)
-			}
-
-			// Compose snapshots (if previous tick had structs)
-			oldCompose := make(map[string]float64, 4) // key -> old mass
-			composeName := make(map[string]string, 4) // key -> pretty name
-			if len(ctx.PrevStructSet) > 0 {
-				for base := range ctx.PrevStructSet {
-					a, b, ok := parsePairMembers(base)
-					if !ok {
-						continue
-					}
-					if tok == a || tok == b {
-						continue // same rule as Plasticity
-					}
-
-					ck := base + "||" + tok
-					oldCompose[ck] = ctx.SeenComposes[ck]
-					composeName[ck] = fmt.Sprintf("[%s-%s]", base, tok) // e.g. [[1-2]-3]
-				}
-			}
-
-			// Prediction transition snapshots (struct -> tok)
-			oldTrans := make(map[string]float64, 4) // st -> old weight for this tok
-			if len(ctx.PrevStructSet) > 0 {
-				for st := range ctx.PrevStructSet {
-					if m, ok := ctx.TransCounts[st]; ok {
-						oldTrans[st] = m[tok]
-					} else {
-						oldTrans[st] = 0
-					}
-				}
-			}
-
-			out := RunTick(ctx, []Signal{inSig})
-
-			actions := make([]string, 0, 8)
-			structs := make([]string, 0, 8)
-			errs := make([]string, 0, 8)
-
-			for _, s := range out {
-				if s.Kind == K_ACTION {
-					actions = append(actions, s.Value)
-					episodeActions = append(episodeActions, s.Value)
-				}
-				if s.Kind == K_STRUCT {
-					structs = append(structs, s.Value)
-					episodeStructs = append(episodeStructs, s.Value)
-				}
-				if s.Kind == K_ERR {
-					errs = append(errs, s.Value)
-					episodeErrs = append(episodeErrs, s.Value)
-				}
-			}
-
-			// --- Build CHARGE lines (accumulation visibility) ---
-			chargeLines := make([]string, 0, 8)
-
-			if pairK != "" {
-				now := ctx.SeenPairs[pairK]
-				if now > oldPair {
-					chargeLines = append(chargeLines,
-						fmt.Sprintf("CHARGE PAIR %s  mass=%.2f/1.00 (+%.2f)", pairName, now, now-oldPair),
-					)
-					if now >= 0.85 && now < 1.0 {
-						chargeLines = append(chargeLines,
-							fmt.Sprintf("NEAR-CRYSTAL %s (next repeat likely forms a block)", pairName),
-						)
-					}
-				}
-			}
-			if seqK != "" {
-				now := ctx.SeenSeq[seqK]
-				if now > oldSeq {
-					chargeLines = append(chargeLines,
-						fmt.Sprintf("CHARGE SEQ  %s  mass=%.2f/1.00 (+%.2f)", seqName, now, now-oldSeq),
-					)
-					if now >= 0.85 && now < 1.0 {
-						chargeLines = append(chargeLines,
-							fmt.Sprintf("NEAR-CRYSTAL %s", seqName),
-						)
-					}
-				}
-			}
-			for ck, oldV := range oldCompose {
-				now := ctx.SeenComposes[ck]
-				if now > oldV {
-					nm := composeName[ck]
-					chargeLines = append(chargeLines,
-						fmt.Sprintf("CHARGE COMP %s  mass=%.2f/1.00 (+%.2f)", nm, now, now-oldV),
-					)
-					if now >= 0.85 && now < 1.0 {
-						chargeLines = append(chargeLines,
-							fmt.Sprintf("NEAR-CRYSTAL %s", nm),
-						)
-					}
-				}
-			}
-			for st, oldW := range oldTrans {
-				nowW := 0.0
-				if m, ok := ctx.TransCounts[st]; ok {
-					nowW = m[tok]
-				}
-				if nowW > oldW {
-					chargeLines = append(chargeLines,
-						fmt.Sprintf("CHARGE PRED %s -> %s  w=%.2f (+%.2f)", st, tok, nowW, nowW-oldW),
-					)
-				}
-			}
-
-			// --- INVESTOR MODE printing rules ---
-			if investorMode {
-				// If truly nothing changed, keep it silent.
-				if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) == 0 {
-					if sleepMs > 0 {
-						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-					}
-					// Save last episode & continue
-					lastEpisodeStructs = episodeStructs
-					lastEpisodeActions = episodeActions
-					lastEpisodeErrs = episodeErrs
-					continue
-				}
-
-				// If only CHARGE happened, print compact “accumulation tick”
-				if len(structs) == 0 && len(actions) == 0 && len(errs) == 0 && len(chargeLines) > 0 {
-					fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
-					for _, ln := range chargeLines {
-						fmt.Printf("           %s\n", ln)
-					}
-					fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
-
-					if sleepMs > 0 {
-						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-					}
-
-					// Save last episode for "board" command
-					lastEpisodeStructs = episodeStructs
-					lastEpisodeActions = episodeActions
-					lastEpisodeErrs = episodeErrs
-
-					// autoboard is already disabled in investor on, but keep behavior consistent
-					if autoBoard {
-						printBoard(ctx, episodeStructs, episodeActions, episodeErrs)
-					}
-					continue
-				}
-			}
-
-			// normal print (or investor event tick)
-			if len(structs) > 0 {
-				fmt.Printf("t=%03d INPUT=%s  STRUCT=%v\n", ctx.Tick, tok, structs)
-			} else {
-				fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
-			}
-
-			// In verbose mode, also show CHARGE lines when present (optional, but informative)
-			if !investorMode && len(chargeLines) > 0 {
-				for _, ln := range chargeLines {
-					fmt.Printf("           %s\n", ln)
-				}
-			}
-
-			if len(actions) > 0 {
-				fmt.Printf("           ACTION=%v\n", actions)
-			}
-			if len(errs) > 0 {
-				fmt.Printf("           ERROR=%v\n", errs)
-			}
-
-			// collect inhibited hypotheses for a summary line (unique structs from this error burst)
-			suppressed := make(map[string]bool, 8)
-
-			// Cosmetic: one short "expected" line before detailed EXPECT prints
-			if investorMode && len(errs) > 0 {
-				uniq := make(map[string]bool, 8)
-				parts := make([]string, 0, 8)
-
-				for _, ev := range errs {
-					st, pred, _, ok := parseErrTriplet(ev)
-					if !ok || uniq[st] {
-						continue
-					}
-					uniq[st] = true
-
-					showPred := pred
-					if b := oldBest[st]; b != "" {
-						showPred = b
-					}
-					conf := oldConf[st]
-					parts = append(parts, fmt.Sprintf("%s⇒%s(stability=%.2f)", st, showPred, conf))
-				}
-
-				if len(parts) > 0 {
-					fmt.Printf("           EMERGENT EXPECTATIONS: %s\n", strings.Join(parts, " ; "))
-				}
-			}
-
-			for _, ev := range errs {
-				st, pred, actual, ok := parseErrTriplet(ev)
-				if !ok {
-					continue
-				}
-
-				if ctx.Inhib[st] > 0.0 {
-					suppressed[st] = true
-				}
-
-				// confidence delta (old -> new)
-				before := oldConf[st]
-				after := ctx.PredConf[st]
-
-				// if oldBest is empty, fall back to pred from the event
-				showPred := pred
-				if b := oldBest[st]; b != "" {
-					showPred = b
-				}
-
-				if ctx.LearningEnabled {
-					fmt.Printf("           EXPECT %s = %s (%.2f) -> GOT %s -> SURPRISE -> UPDATED (conf %.2f->%.2f)\n",
-						st, showPred, before, actual, before, after)
-				} else {
-					fmt.Printf("           EXPECT %s = %s (%.2f) -> GOT %s -> SURPRISE\n",
-						st, showPred, before, actual)
-				}
-
-				_ = after // keep "after" read; useful for future prints
-			}
-
-			// A) investor summary line after error burst
-			if investorMode && len(errs) > 0 {
-				inhibN := len(suppressed)
-				if inhibN == 0 {
-					inhibN = len(errs) // fallback
-				}
-				fmt.Printf("           FIELD RESPONSE: inhib=%d hypotheses | error-boost ttl=%d gain=%.2f\n",
-					inhibN, ctx.ErrTTL, ctx.ErrGain)
-			}
-
-			// --- investor: show energy "at the moment" of activity ---
-			if len(structs) > 0 || len(actions) > 0 || len(errs) > 0 {
-				fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
-			}
-
-			if sleepMs > 0 {
-				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-			}
-
-			// Save last episode for "board" command
-			lastEpisodeStructs = episodeStructs
-			lastEpisodeActions = episodeActions
-			lastEpisodeErrs = episodeErrs
-
-			// Investor-friendly board after each episode (toggleable)
-			if autoBoard {
-				printBoard(ctx, episodeStructs, episodeActions, episodeErrs)
-			}
-		}
+		// Default: interpret input as an episode line
+		// (episode boundary is applied inside RunEpisodeLine)
+		rep := RunEpisodeLine(ctx, line, investorMode, demoRunning, sleepMs, autoBoard)
+		lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
+		lastBoardCtx = ctx
 	}
 }
