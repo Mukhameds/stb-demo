@@ -1,140 +1,85 @@
-# ARA — Vision
-
-ARA (realAI) is an attempt to build artificial intelligence
-by reproducing the mechanisms of thinking
-observed in biological intelligence.
-
-At its core, ARA is based on the original STB paradigm
-(Signal–Block Theory),
-in which system behavior emerges
-from continuous interaction of signals,
-internal structures, and stabilization mechanisms,
-rather than from training on predefined datasets.
 
 ---
 
-## Starting point
+# **VISION**
 
-Most modern AI systems are built around approximation:
-they adjust parameters
-to minimize error on data.
+We see a future in which artificial intelligence is
+**not an on-demand tool**,
+but a **long-lived intellectual partner**.
 
-Human intelligence works differently.
+Most modern AI systems exist in a fragmented form:
+they answer questions, solve isolated tasks,
+and then disappear without preserving themselves over time.
 
-The brain:
-- does not learn in isolated phases;
-- does not optimize a global error function;
-- does not strictly separate “training” from “use”.
-
-Instead, it continuously:
-- receives signals and external stimuli;
-- forms internal structures;
-- links them through associations;
-- reinforces stable configurations;
-- restructures itself when confronted with novelty.
-
-ARA aims to reproduce this level —
-the level of **mechanisms**, not anatomy.
+Yet the real value of intelligence lies not in individual answers,
+but in the ability to **accumulate experience, understand context, develop, and preserve individuality**.
 
 ---
 
-## What the current demo shows
+## AI as an extension of the human
 
-The demo in this repository is a minimal, isolated process
-that demonstrates the architectural feasibility of the approach.
+We envision a world in which every person has a
+**personal artificial intelligence** that:
 
-It already contains key mechanisms:
+* remembers their history;
+* understands their goals, values, and way of thinking;
+* develops together with them over years;
+* helps make decisions rather than merely generating answers;
+* serves the interests of the individual, not a corporation.
 
-- continuous signal processing;
-- accumulation and competition of internal structures;
-- stabilization through repetition and inhibition;
-- emergence of expectations as dominant configurations;
-- collapse of expectations when patterns are violated;
-- contextual field reconfiguration without explicit learning.
-
-Important:  
-there are no datasets, gradients, reward functions,
-or classical learning loops.
-
-Behavior emerges as a consequence of local interactions.
+**ARA** is a step toward such an intelligence.
 
 ---
 
-## Analogy with human intelligence
+## Long-lived intelligence instead of one-off answers
 
-In the biological brain, stable structures form
-not because of a single signal,
-but due to coincidence and mutual reinforcement
-of reactions from multiple functional circuits:
-sensory, emotional, cognitive, and contextual.
+We are convinced that true AI must:
 
-The more aligned reactions
-support the same pattern,
-the higher its stability
-and the stronger its influence on behavior.
+* exist continuously, not only on request;
+* have its own internal dynamics;
+* be able to make mistakes, remember, and rethink;
+* form stable models of the world;
+* evolve without constant external retraining.
 
-In the demo, this principle is implemented in minimal form:
-structures are reinforced through repetition and association,
-expectations arise from dominant configurations,
-and “error” manifests not as a number,
-but as the collapse of expectations
-followed by internal reconfiguration.
+Such an AI becomes a **subject of interaction**,
+not merely a computational function.
 
 ---
 
-## Where this leads (ARA)
+## Benefit for society
 
-ARA is envisioned as an extension of this approach
-toward a full, long-lived intelligence.
+A new class of intelligent systems opens possibilities
+that extend far beyond business:
 
-In its mature form, ARA is:
+* personal education and mentorship;
+* cognitive support and human capability enhancement;
+* autonomous systems operating where no cloud is available;
+* technologies that respect privacy and data locality;
+* reduced dependence on physical labor through autonomy and cost reduction;
+* more sustainable and energy-efficient use of computation.
 
-- a personal artificial intelligence, not a universal model;
-- a system with continuous internal thinking;
-- accumulation of experience through lived interaction,
-  not through offline training;
-- formation of motivations, goals, and preferences;
-- ability to generate ideas, search for solutions,
-  and make decisions;
-- orientation toward helping its user.
-
-ARA is intended to:
-- understand its role and purpose;
-- maintain stable motivational structures;
-- adapt alongside its user;
-- develop throughout its entire “lifetime”.
+We believe AI should **augment the human**,
+not replace them or alienate their experience.
 
 ---
 
-## How we intend to implement it
+## Our direction
 
-Technically, ARA is built as an architecture,
-not as a trainable model.
+**ARA**, built on the STB paradigm, is:
 
-Key implementation principles:
+* not just another assistant;
+* not a chatbot;
+* not an AI wrapper.
 
-- signal–reactive logic instead of parameter optimization;
-- absence of a centralized controller;
-- competition and inhibition as core regulators;
-- continuous internal thinking, not only reactive responses;
-- long-term memory as a field of stable structures;
-- growth of complexity through added mechanisms,
-  not through data scaling.
-
-The demo in this repository
-is the first, intentionally simplified step
-in this direction.
+It is an attempt to create a **new class of intelligent systems** —
+personal, long-lived, adaptive, and responsible.
 
 ---
 
-## Status
+## In one thought
 
-This repository:
-- is not a product;
-- does not aim for completeness;
-- serves as a proof of architectural principle.
+> **We are building AI that lives over time,
+> evolves together with the human,
+> and remains useful in the long term.**
 
-Further development of ARA
-goes beyond this demo
-and предполагает separate modules,
-experiments, and architectural iterations.
+---
