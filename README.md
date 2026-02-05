@@ -4,7 +4,13 @@
 # **STB ARA — an architecture that makes AI businesses economically viable and socially useful**
 
 **Founder:** Mukhamed Satybaev
+
+---
+
 **Stage:** Working prototype / Demo
+
+---
+
 **Category:** AI / Systems / Infrastructure
 
 ---
