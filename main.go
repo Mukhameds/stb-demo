@@ -389,60 +389,56 @@ func NewCoActBlock(a, b string) *CoActBlock {
 func (b *CoActBlock) ID() string { return "COACT:" + b.name }
 
 func (b *CoActBlock) React(s Signal, ctx *Context) []Signal {
-	if s.Kind != K_ACT {
-		return nil
-	}
-	if s.Value != b.a && s.Value != b.b {
-		return nil
-	}
+    if s.Kind != K_ACT {
+        return nil
+    }
+    // adjacency trigger: rely on sensory chain, not RecentActs scan
+    if ctx.PrevSens == "" || ctx.LastSens == "" {
+        return nil
+    }
+    // current tick input is ctx.LastSens; previous is ctx.PrevSens
+    a := ctx.PrevSens
+    c := ctx.LastSens
+    if a == c {
+        return nil
+    }
 
-	other := b.b
-	if s.Value == b.b {
-		other = b.a
-	}
+    // does this adjacency match this pair block?
+    // pair is unordered, so {a,c} must be {b.a,b.b}
+    if !((a == b.a && c == b.b) || (a == b.b && c == b.a)) {
+        return nil
+    }
 
-	for i := len(ctx.RecentActs) - 1; i >= 0; i-- {
-		r := ctx.RecentActs[i]
-		if r.Time < ctx.Tick-b.window {
-			break
-		}
-		if r.Kind == K_ACT && r.Value == other {
+    // keep-alive
+    ctx.BlockLastFire[b.ID()] = ctx.Tick
 
-			// ✅ mature mode: emit ONLY on immediate adjacency (previous tick)
-			if b.mature {
-				if r.Time != ctx.Tick-1 {
-					return nil
-				}
-				return []Signal{{
-					Kind:  K_STRUCT,
-					Value: b.name,
-					Mass:  b.emitMass,
-					Time:  ctx.Tick,
-					From:  b.ID(),
-				}}
-			}
+    if b.mature {
+        // mature: emit on every adjacency match
+        return []Signal{{
+            Kind:  K_STRUCT,
+            Value: b.name,
+            Mass:  b.emitMass,
+            Time:  ctx.Tick,
+            From:  b.ID(),
+        }}
+    }
 
-			// not mature yet -> accumulate toward first crystallization
-			b.accum += 1.0
-			break
-		}
-	}
+    // not mature: accumulate toward crystallization
+    b.accum += 1.0
+    if b.accum >= b.threshold {
+        b.accum = b.threshold * 0.5
+        b.mature = true
+        return []Signal{{
+            Kind:  K_STRUCT,
+            Value: b.name,
+            Mass:  b.emitMass,
+            Time:  ctx.Tick,
+            From:  b.ID(),
+        }}
+    }
 
-	if b.accum >= b.threshold {
-		b.accum = b.threshold * 0.5
-		b.mature = true // ✅ crystallized => becomes a fast reflex (adjacent-only)
-		return []Signal{{
-			Kind:  K_STRUCT,
-			Value: b.name,
-			Mass:  b.emitMass,
-			Time:  ctx.Tick,
-			From:  b.ID(),
-		}}
-	}
-
-	return nil
+    return nil
 }
-
 
 func (b *CoActBlock) Tick(ctx *Context) []Signal {
 	if b.accum > 0 {
@@ -510,6 +506,9 @@ func (b *SeqBlock) React(s Signal, ctx *Context) []Signal {
 	if !triggered {
 		return nil
 	}
+	// NEW: keep-alive (block reacted / confirmed pattern)
+	ctx.BlockLastFire[b.ID()] = ctx.Tick
+
 
 	// ✅ mature mode: ONLY immediate adjacency
 	if b.mature {
@@ -1060,8 +1059,13 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	clearStringMap(ctx.ThisExpect)
 
 	// ---------- PREDICTION ERROR CHECK ----------
+	// IMPORTANT FIX:
+	// 1) ERR may be PRINTED/emitted every time (telemetry),
+	// 2) but "hammer" side-effects (Inhib + ErrTTL + cooldown set) happen ONLY when cooldown==0,
+	// 3) learning pressure (TransCounts) may still accumulate every time (gradual re-learn).
 	errSignals := make([]Signal, 0, 4)
-	hadErrThisTick := false
+	hadErrThisTick := false // means: we applied the "hammer" side-effects this tick
+	
 
 	// first sensory token of this tick
 	actual := ""
@@ -1077,17 +1081,10 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 			if pred == "" || pred == actual {
 				continue
 			}
-			if ctx.ErrCooldown[st] > 0 {
-				continue
-			}
 
-			hadErrThisTick = true
+			inCooldown := ctx.ErrCooldown[st] > 0
 
-			// emit error (field event)
-			ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
-			ctx.ErrTTL = 3
-			ctx.Inhib[st] += 0.6
-
+			// Always emit error (field event / telemetry), even in cooldown.
 			errSignals = append(errSignals, Signal{
 				Kind:  K_ERR,
 				Value: fmt.Sprintf("%s:%s->%s", st, pred, actual),
@@ -1096,32 +1093,56 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				From:  "FIELD:PRED",
 			})
 
-			// ✅ STB CORE: error must TEACH (mass accumulates), but must NOT insta-flip.
-			// We only update raw transition masses here; the "public switch" is gated in Plasticity().
+			// --- STB CORE: error must TEACH gradually ---
 			if ctx.LearningEnabled && ctx.LearnPred {
 				if _, ok := ctx.TransCounts[st]; !ok {
 					ctx.TransCounts[st] = make(map[string]float64)
 				}
 
-				// 1) gently erode the wrong dominant (prevents permanent dogma)
+				// 1) gently erode wrong dominant (prevents permanent dogma)
 				if w, ok := ctx.TransCounts[st][pred]; ok && w > 0 {
-					ctx.TransCounts[st][pred] = w * 0.80
+					ctx.TransCounts[st][pred] = w * 0.92
 					if ctx.TransCounts[st][pred] < 0.05 {
 						delete(ctx.TransCounts[st], pred)
 					}
 				}
 
-				// 2) accumulate "pressure" for the actual token (slowly, repeatable)
-				// On persistent mismatch, this pressure can eventually overcome old dominance.
+				// 2) accumulate pressure for actual token (repeatable, gradual)
+				// If we're in cooldown, we bump less (still learns, no thrash).
 				bump := 0.14
-				if ctx.ErrTTL > 0 {
-					bump = 0.10
+				if inCooldown {
+					bump = 0.08
 				}
 				ctx.TransCounts[st][actual] += bump
 
 				// 3) clamp runaway
 				if ctx.TransCounts[st][actual] > 3.00 {
 					ctx.TransCounts[st][actual] = 3.00
+				}
+			}
+
+			// --- "Hammer" side-effects ONLY when cooldown is over ---
+			if !inCooldown {
+				hadErrThisTick = true
+
+				// start cooldown window so we don't re-hammer on the same mismatch
+				ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
+
+				// short-lived "error context" (used by Plasticity gating)
+				ctx.ErrTTL = 3
+
+				// KEY FIX: do NOT heavily inhibit the STRUCT itself each time.
+				// Inhibit the *wrong hypothesis* (prediction signal) so structure can stay alive
+				// while the wrong expectation is suppressed.
+				//
+				// Note: prediction signals are formatted as "st->tok" in this system.
+				predKey := fmt.Sprintf("%s->%s", st, pred)
+				ctx.Inhib[predKey] += 0.6   // suppress wrong expectation strongly
+				ctx.Inhib[st] += 0.08       // tiny damping on struct (optional, prevents runaway spam)
+
+				// (optional) record / log if you have PredEvents
+				if ctx.PredEvents != nil {
+					ctx.PredEvents = append(ctx.PredEvents, fmt.Sprintf("ERR %s expected %s got %s", st, pred, actual))
 				}
 			}
 		}
@@ -1149,7 +1170,7 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	queue = append(queue, errSignals...)
 	queue = append(queue, emitted...)
 
-	// weak always-on predictions
+	// weak always-on predictions (MODEL_WEAK)
 	for st, tok := range ctx.BestPred {
 		conf := ctx.PredConf[st]
 		if tok == "" || conf < 0.25 {
@@ -1188,26 +1209,17 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				}
 			}
 
-			if s.Kind == K_ACT {
-				ctx.RecentActs = append(ctx.RecentActs, s)
-			}
-
 			if s.Kind == K_STRUCT {
 				ctx.RecentStruct = append(ctx.RecentStruct, s)
 
-				if ctx.DemoFocusPairsOnly {
-					isPair := strings.HasPrefix(s.Value, "[") && strings.HasSuffix(s.Value, "]")
-					if !isPair {
-						goto AFTER_STRUCT_COLLECT
-					}
-				}
-
+				// Core field must not UI-filter structures.
 				ctx.ThisStructSet[s.Value] = true
 				ctx.ThisStructMass[s.Value] += s.Mass
 
+				// If structure isn't heavily inhibited, we may emit a model prediction signal.
+				// NOTE: we do NOT fill ctx.ThisExpect here anymore (it was being cleared later).
 				if ctx.Inhib[s.Value] <= 0.7 {
 					if pred := ctx.BestPred[s.Value]; pred != "" {
-						ctx.ThisExpect[s.Value] = pred
 						nextQueue = append(nextQueue, Signal{
 							Kind:  K_PRED,
 							Value: fmt.Sprintf("%s->%s", s.Value, pred),
@@ -1217,9 +1229,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 						})
 					}
 				}
-
-			AFTER_STRUCT_COLLECT:
-				_ = 0
 			}
 
 			for _, id := range ctx.Order {
@@ -1281,7 +1290,8 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	}
 
 	// ---------- PLASTICITY ----------
-	// Учим всегда. Переключение BestPred на err-тике допускается ТОЛЬКО при "давлении" (см. Plasticity()).
+	// "hadErrThisTick" now means: we applied hammer side-effects (first mismatch after cooldown).
+	// That gives Plasticity a clean, non-spammy signal.
 	if ctx.LearningEnabled {
 		Plasticity(ctx, hadErrThisTick)
 	}
@@ -1289,7 +1299,8 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	// ---------- WINNER-ONLY ARMING (NEXT TICK EXPECTATIONS) ----------
 	clearStringMap(ctx.ThisExpect)
 
-	// If ERR this tick -> do not arm for next tick (prevents immediate double-ERR loop).
+	// If we applied hammer this tick -> do not arm for next tick (prevents immediate double-ERR loop).
+	// If mismatch exists but was in cooldown, we still allow arming: it is suppressed by PRED inhibition anyway.
 	if !hadErrThisTick {
 		if winner != "" && ctx.Inhib[winner] <= 0.7 {
 			if keepPred := ctx.BestPred[winner]; keepPred != "" {
@@ -1314,8 +1325,12 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		pruneOldBlocks(ctx)
 	}
 
+	// (optional) you can keep a debug flag using sawMismatchThisTick if you want,
+	// but we don't change behavior based on it here.
+
 	return allOut
 }
+
 
 const PredSwitchMass = 1.0
 
@@ -1614,9 +1629,6 @@ func resetEpisodeBoundary(ctx *Context) {
 	clearFloatMap(ctx.Inhib)
 	clearIntMap(ctx.ErrCooldown)
 
-	clearFloatMap(ctx.ThisStructMass)  // не обязательно, но честно
-	clearFloatMap(ctx.Inhib)           // ВАЖНО для manual: иначе прошлые подавления искажают новый эпизод
-	clearIntMap(ctx.ErrCooldown)       // нужно добавить helper (ниже)
 }
 
 func uniqueSorted(xs []string) []string {
@@ -2568,151 +2580,168 @@ func main() {
 			continue
 
 		case "pairs on":
-			ctx.DemoFocusPairsOnly = true
-			fmt.Println("Pairs-only mode = ON (competition/arming/pred-pulses use only [a-b])")
-			continue
+		    ctx.DemoFocusPairsOnly = true
+		    fmt.Println("Pairs-only mode = ON (UI-only: hides non-[a-b] in episode/board output)")
+		    continue
 
 		case "pairs off":
-			ctx.DemoFocusPairsOnly = false
-			fmt.Println("Pairs-only mode = OFF (SEQ/COMPOSE also participate)")
-			continue
+		    ctx.DemoFocusPairsOnly = false
+		    fmt.Println("Pairs-only mode = OFF (UI-only)")
+		    continue
+
 
 
 			// --- DEMO SCRIPT ---
-		case "demo":
-			// Save user's current CLI toggles (demo must not mess up normal use)
-			prevInvestorMode := investorMode
-			prevAutoBoard := autoBoard
-			prevSleepMs := sleepMs
-			prevDemoRunning := demoRunning
+case "demo":
+	// Save user's current CLI toggles (demo must not mess up normal use)
+	prevInvestorMode := investorMode
+	prevAutoBoard := autoBoard
+	prevSleepMs := sleepMs
+	prevDemoRunning := demoRunning
 
-			// Presentation setup (cosmetic only)
-			demoRunning = true
-			investorMode = true
-			autoBoard = false
-			sleepMs = 0
-			fmt.Println("Demo: investor mode ON, running scripted sequence...")
+	// Presentation setup (cosmetic only)
+	demoRunning = true
+	investorMode = true
+	autoBoard = false
+	sleepMs = 0
+	fmt.Println("Demo: investor mode ON, running scripted sequence...")
 
-			// IMPORTANT: run demo on a clean isolated context (deterministic)
-			demoCtx := NewContext()
-			demoCtx.LearningEnabled = true
-			demoCtx.DemoFocusPairsOnly = true
-			demoCtx.DisableSeq = true
-			demoCtx.LearnPred = false   // Step 1: запретить обучение предсказаний
-			demoCtx.LearnStruct = true  // Step 1: разрешить обучение структур
+	// IMPORTANT: run demo on a clean isolated context (deterministic)
+	demoCtx := NewContext()
+	demoCtx.LearningEnabled = true
+	demoCtx.DemoFocusPairsOnly = true
+	demoCtx.DisableSeq = true
 
-			// reset last episode buffers for board prints inside demo
-			lastEpisodeStructs = nil
-			lastEpisodeActions = nil
-			lastEpisodeErrs = nil
+	// reset last episode buffers for board prints inside demo
+	lastEpisodeStructs = nil
+	lastEpisodeActions = nil
+	lastEpisodeErrs = nil
 
-demoCtx.SuppressPredLog = true
-demoCtx.LearnStruct = true
-demoCtx.LearnPred = false // желательно, но теперь уже не критично
+	// -----------------------------------------
+	// STEP 1: ACCUMULATION -> CRYSTALLIZATION
+	// -----------------------------------------
+	demoCtx.SuppressPredLog = true
+	demoCtx.LearnStruct = true
+	demoCtx.LearnPred = false
 
-			// ✅ C3-B: Step 1 should be short & event-dense (crystallize only what we need)
-			// Pair adds ~0.40 per repeat, Seq adds ~0.45 => 3 repeats reliably crystallize.
-			demoCtx.LearnStruct = true
-			demoCtx.LearnPred = false
+	fmt.Println("DEMO STEP 1/3: ACCUMULATION -> CRYSTALLIZATION")
 
-			fmt.Println("DEMO STEP 1/3: ACCUMULATION -> CRYSTALLIZATION")
-			rep := RunEpisodeLine(demoCtx, "1 2 1 2 1 2  2 3 2 3 2 3", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	// 6× (1 2) and 6× (2 3) — deterministic pair crystallization
+	rep := RunEpisodeLine(
+		demoCtx,
+		"1 2 1 2 1 2 1 2 1 2 1 2   2 3 2 3 2 3 2 3 2 3 2 3",
+		investorMode, demoRunning, sleepMs, false,
+	)
 
-			lastBoardCtx = demoCtx
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
 
-			// Explain why structures are not shown in Step 1
-			fmt.Println("NOTE: Step 1 reports accumulation and block crystallization (new blocks). STRUCT signals appear in Step 2.")
+	printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	lastBoardCtx = demoCtx
 
-			// ✅ DEMO: начиная со Step 2 — фокус только на PAIR-структурах ([a-b]) в competition/arming/pred-pulses
-			demoCtx.DemoFocusPairsOnly = true
+	fmt.Println("NOTE: Step 1 reports accumulation and block crystallization (new blocks). STRUCT signals appear in Step 2.")
 
-demoCtx.SuppressPredLog = false
-demoCtx.LearnStruct = false
-demoCtx.LearnPred = true
+	// -----------------------------------------
+	// STEP 2: STRUCTURES -> PREDICTION
+	// -----------------------------------------
+	demoCtx.SuppressPredLog = false
+	demoCtx.LearnStruct = false
+	demoCtx.LearnPred = true
+	demoCtx.DemoFocusPairsOnly = true
 
-			// Step 2: show structures driving predictions (keep it dense; no need for long repetition)
-			demoCtx.LearnStruct = false // <-- STOP birthing new PAIR/SEQ/COMPOSE here
-			demoCtx.LearnPred = true    // <-- keep learning TransCounts to show stable expectations
+	fmt.Println("DEMO STEP 2/3: STRUCTURES -> PREDICTION")
 
-			fmt.Println("DEMO STEP 2/3: STRUCTURES -> PREDICTION")
-			rep = RunEpisodeLine(demoCtx, "1 2 3 1 2 3 1 2 3", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	// 6× (1 2 3) — stable expectation buildup
+	rep = RunEpisodeLine(
+		demoCtx,
+		"1 2 3 1 2 3 1 2 3 1 2 3 1 2 3 1 2 3",
+		investorMode, demoRunning, sleepMs, false,
+	)
 
-			lastBoardCtx = demoCtx
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
 
-			// Step 3: keep learning REAL only where it matters (switch), keep prime/verify clean for YC
-			fmt.Println("DEMO STEP 3/3: MISPREDICTION -> INHIBITION + ERROR-BOOST -> FAST RE-LEARN")
+	printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	lastBoardCtx = demoCtx
 
-			// 3A) PRIME (separate episode): show stable learned expectation [1-2]⇒3.
-			// IMPORTANT (YC): learning OFF here so we don't accidentally "teach" seq (1>2)⇒3 and create extra errors later.
-			demoCtx.LearningEnabled = false
-			demoCtx.LearnStruct = false
-			demoCtx.LearnPred = false
+	// -----------------------------------------
+	// STEP 3: MISPREDICTION -> FAST RE-LEARN
+	// -----------------------------------------
+	fmt.Println("DEMO STEP 3/3: MISPREDICTION -> INHIBITION + ERROR-BOOST -> FAST RE-LEARN")
 
-			rep = RunEpisodeLine(demoCtx, "1 2 3", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "after prime episode: 1 2 3")
+	// 3A) PRIME (clean, no learning)
+	demoCtx.LearningEnabled = false
+	demoCtx.LearnStruct = false
+	demoCtx.LearnPred = false
 
-			// 3B) SWITCH (separate episode): now force the clean misprediction [1-2]:3->4 and fast re-learn to 4.
-			// learning ON here so error-boost and adaptation are real (not "fake").
-			demoCtx.LearningEnabled = true
-			demoCtx.LearnStruct = false
-			demoCtx.LearnPred = true
+	rep = RunEpisodeLine(demoCtx, "1 2 3", investorMode, demoRunning, sleepMs, false)
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
+	demoPulse(demoCtx, "after prime episode: 1 2 3")
 
-			// усиление: даём два подтверждения в одном эпизоде, чтобы BestPred успел переключиться
-			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "after clean switch episode: 1 2 4")
-			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	// 3B) SWITCH — 6× (1 2 4), learning ON
+	demoCtx.LearningEnabled = true
+	demoCtx.LearnStruct = false
+	demoCtx.LearnPred = true
 
+	rep = RunEpisodeLine(
+		demoCtx,
+		"1 2 4 1 2 4 1 2 4 1 2 4 1 2 4 1 2 4",
+		investorMode, demoRunning, sleepMs, false,
+	)
 
-			// 3C) VERIFY (two episodes):
-			// verify #1 = TRAIN (finish adaptation if needed)
-			// verify #2 = TEST  (prove stability without learning)
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
+	demoPulse(demoCtx, "after clean switch episode: 1 2 4")
+	printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
 
-			// verify #1 (TRAIN) — один прогон, чтобы не раздувать лог
-			demoCtx.LearningEnabled = true
-			demoCtx.LearnStruct = false
-			demoCtx.LearnPred = true
+	// 3C) VERIFY
+	// verify #1 (TRAIN)
+	demoCtx.LearningEnabled = true
+	demoCtx.LearnStruct = false
+	demoCtx.LearnPred = true
 
-			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "verify #1 (train): 1 2 4")
+	rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
+	demoPulse(demoCtx, "verify #1 (train): 1 2 4")
 
-			// verify #2 (TEST) — чистая проверка без обучения
-			demoCtx.LearningEnabled = false
-			demoCtx.LearnStruct = false
-			demoCtx.LearnPred = false
+	// verify #2 (TEST)
+	demoCtx.LearningEnabled = false
+	demoCtx.LearnStruct = false
+	demoCtx.LearnPred = false
 
-			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "verify #2 (test): 1 2 4")
+	rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
+	lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs =
+		rep.Structs, rep.Actions, rep.Errs
 
-			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
-			lastBoardCtx = demoCtx
+	demoPulse(demoCtx, "verify #2 (test): 1 2 4")
+	printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
+	lastBoardCtx = demoCtx
 
+	// -----------------------------------------
+	// SUMMARY
+	// -----------------------------------------
+	pairs := countBlocksByPrefix(demoCtx, "COACT:")
+	seqs := countBlocksByPrefix(demoCtx, "SEQ:")
+	comps := countBlocksByPrefix(demoCtx, "COMPOSE:")
+	acts := countBlocksByPrefix(demoCtx, "ACTIONBLOCK:")
 
-			// Cosmetic: final one-shot summary (no logic change; counts from existing blocks)
-			pairs := countBlocksByPrefix(demoCtx, "COACT:")
-			seqs := countBlocksByPrefix(demoCtx, "SEQ:")
-			comps := countBlocksByPrefix(demoCtx, "COMPOSE:")
-			acts := countBlocksByPrefix(demoCtx, "ACTIONBLOCK:")
+	fmt.Printf(
+		"DEMO SUMMARY: learned pairs=%d | seqs=%d | composes=%d | actionLinks=%d | blocks=%d\n",
+		pairs, seqs, comps, acts, len(demoCtx.Blocks),
+	)
 
-			fmt.Printf("DEMO SUMMARY: learned pairs=%d | seqs=%d | composes=%d | actionLinks=%d | blocks=%d\n",
-			    pairs, seqs, comps, acts, len(demoCtx.Blocks))
+	demoCtx.DemoFocusPairsOnly = false
 
-			    demoCtx.DemoFocusPairsOnly = false
+	// Restore user's CLI toggles
+	investorMode = prevInvestorMode
+	autoBoard = prevAutoBoard
+	sleepMs = prevSleepMs
+	demoRunning = prevDemoRunning
 
-			// Restore user's CLI toggles
-			investorMode = prevInvestorMode
-			autoBoard = prevAutoBoard
-			sleepMs = prevSleepMs
-			demoRunning = prevDemoRunning
+	continue
 
-			continue
 
 		}
 
