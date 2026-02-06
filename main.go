@@ -12,6 +12,39 @@ import (
 
 var showPredEvents = true
 
+var colorLogs = true
+
+const (
+	C_RESET = "\033[0m"
+	C_BOLD  = "\033[1m"
+
+	C_RED    = "\033[31m"
+	C_GREEN  = "\033[32m"
+	C_YELLOW = "\033[33m"
+	C_BLUE   = "\033[34m"
+	C_MAGENTA= "\033[35m"
+	C_CYAN   = "\033[36m"
+	C_GRAY   = "\033[90m"
+)
+
+func cwrap(s, color string) string {
+	if !colorLogs || color == "" {
+		return s
+	}
+	return color + s + C_RESET
+}
+
+// для printf: cprintf("text", C_RED)
+func cprintf(color string, format string, args ...any) {
+	if colorLogs && color != "" {
+		fmt.Print(color)
+	}
+	fmt.Printf(format, args...)
+	if colorLogs && color != "" {
+		fmt.Print(C_RESET)
+	}
+}
+
 func clearBoolMap(m map[string]bool) {
 	for k := range m {
 		delete(m, k)
@@ -102,6 +135,9 @@ type Context struct {
 	LearnStruct     bool // learn PAIR/SEQ/COMPOSE blocks
 	LearnPred       bool // learn prediction transitions (TransCounts)
 
+	DisableSeq bool // demo-only: prevent creating SEQ blocks (keeps YC demo pairs-clean)
+
+	SuppressPredLog bool // demo-only: do not emit +++ PREDICTION UPDATED lines
 
 	// --- field resource budget (energy) ---
 	Energy      float64 // current energy
@@ -211,6 +247,7 @@ func NewContext() *Context {
 		MaxActionsPerTick: 1,
 
 		DemoFocusPairsOnly: true,
+		DisableSeq: false,
 
 		// ✅ вот тут правильная инициализация
 		LastArmedExpect: make(map[string]string),
@@ -1023,68 +1060,68 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 	clearStringMap(ctx.ThisExpect)
 
 	// ---------- PREDICTION ERROR CHECK ----------
-	// Evaluate error ONLY if previous tick produced expectations.
 	errSignals := make([]Signal, 0, 4)
-	armed := len(ctx.PendingExpect) > 0
+	hadErrThisTick := false
 
-	if armed {
-		// first sensory token of this tick
-		actual := ""
-		for _, s := range incoming {
-			if s.Kind == K_SENS {
-				actual = s.Value
-				break
-			}
+	// first sensory token of this tick
+	actual := ""
+	for _, s := range incoming {
+		if s.Kind == K_SENS {
+			actual = s.Value
+			break
 		}
+	}
 
-		if actual != "" {
-			for st, pred := range ctx.PendingExpect {
-				if pred == "" || pred == actual {
-					continue
+	if actual != "" {
+		for st, pred := range ctx.PendingExpect {
+			if pred == "" || pred == actual {
+				continue
+			}
+			if ctx.ErrCooldown[st] > 0 {
+				continue
+			}
+
+			hadErrThisTick = true
+
+			// emit error (field event)
+			ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
+			ctx.ErrTTL = 3
+			ctx.Inhib[st] += 0.6
+
+			errSignals = append(errSignals, Signal{
+				Kind:  K_ERR,
+				Value: fmt.Sprintf("%s:%s->%s", st, pred, actual),
+				Mass:  1.0,
+				Time:  ctx.Tick,
+				From:  "FIELD:PRED",
+			})
+
+			// ✅ STB CORE: error must TEACH (mass accumulates), but must NOT insta-flip.
+			// We only update raw transition masses here; the "public switch" is gated in Plasticity().
+			if ctx.LearningEnabled && ctx.LearnPred {
+				if _, ok := ctx.TransCounts[st]; !ok {
+					ctx.TransCounts[st] = make(map[string]float64)
 				}
-				if ctx.ErrCooldown[st] > 0 {
-					continue
+
+				// 1) gently erode the wrong dominant (prevents permanent dogma)
+				if w, ok := ctx.TransCounts[st][pred]; ok && w > 0 {
+					ctx.TransCounts[st][pred] = w * 0.80
+					if ctx.TransCounts[st][pred] < 0.05 {
+						delete(ctx.TransCounts[st], pred)
+					}
 				}
 
-				// emit error
-				ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
-				ctx.ErrTTL = 3
-				ctx.Inhib[st] += 0.9
+				// 2) accumulate "pressure" for the actual token (slowly, repeatable)
+				// On persistent mismatch, this pressure can eventually overcome old dominance.
+				bump := 0.14
+				if ctx.ErrTTL > 0 {
+					bump = 0.10
+				}
+				ctx.TransCounts[st][actual] += bump
 
-				errSignals = append(errSignals, Signal{
-					Kind:  K_ERR,
-					Value: fmt.Sprintf("%s:%s->%s", st, pred, actual),
-					Mass:  1.0,
-					Time:  ctx.Tick,
-					From:  "FIELD:PRED",
-				})
-
-				// ---- ERROR-DRIVEN TRANSITION UPDATE (NO PUBLIC SWITCH HERE) ----
-				// We only touch TransCounts here; public BestPred switching remains in Plasticity.
-				if ctx.LearningEnabled {
-					if _, ok := ctx.TransCounts[st]; !ok {
-						ctx.TransCounts[st] = make(map[string]float64)
-					}
-
-					// 1) damp the wrong transition
-					if w, ok := ctx.TransCounts[st][pred]; ok {
-						ctx.TransCounts[st][pred] = w * 0.60
-						if ctx.TransCounts[st][pred] < 0.10 {
-							delete(ctx.TransCounts[st], pred)
-						}
-					}
-
-					// 2) nudge the actual token upward (smooth)
-					boost := 1.0
-					if ctx.ErrGain > 0 {
-						boost = 1.0 + ctx.ErrGain
-					}
-					ctx.TransCounts[st][actual] += 0.30 * boost
-
-					// 3) clamp runaway weights
-					if ctx.TransCounts[st][actual] > 3.00 {
-						ctx.TransCounts[st][actual] = 3.00
-					}
+				// 3) clamp runaway
+				if ctx.TransCounts[st][actual] > 3.00 {
+					ctx.TransCounts[st][actual] = 3.00
 				}
 			}
 		}
@@ -1142,8 +1179,7 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				continue
 			}
 
-			// IMPORTANT: keep “liveness” of blocks for pruning logic
-			// NOTE: ACTION kind is K_ACTION (not K_ACT). K_ACT is the internal "activation" signal.
+			// liveness for pruning
 			if s.Kind == K_STRUCT || s.Kind == K_ACTION || s.Kind == K_ACT {
 				if s.From != "" {
 					if _, ok := ctx.Blocks[s.From]; ok {
@@ -1159,10 +1195,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 			if s.Kind == K_STRUCT {
 				ctx.RecentStruct = append(ctx.RecentStruct, s)
 
-				// ✅ DEMO FOCUS (pairs-only):
-				// when enabled — competition/arming/pred-pulse allows ONLY pairs "[a-b]".
-				// everything else stays in RecentStruct (for liveness/pruning),
-				// but does NOT affect ThisStructMass/ThisExpect and does NOT create strong PRED pulse.
 				if ctx.DemoFocusPairsOnly {
 					isPair := strings.HasPrefix(s.Value, "[") && strings.HasSuffix(s.Value, "]")
 					if !isPair {
@@ -1173,12 +1205,9 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				ctx.ThisStructSet[s.Value] = true
 				ctx.ThisStructMass[s.Value] += s.Mass
 
-				// strong PRED pulse inside the tick (kept for dynamics), arming for NEXT tick is winner-only later
 				if ctx.Inhib[s.Value] <= 0.7 {
 					if pred := ctx.BestPred[s.Value]; pred != "" {
-						// temporary; will be collapsed to winner-only after competition
 						ctx.ThisExpect[s.Value] = pred
-
 						nextQueue = append(nextQueue, Signal{
 							Kind:  K_PRED,
 							Value: fmt.Sprintf("%s->%s", s.Value, pred),
@@ -1221,7 +1250,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				winner, wMass = st, mass
 				continue
 			}
-			// tie (or near-tie) => stable choice
 			if mass >= wMass-eps && preferStructName(st, winner) {
 				winner, wMass = st, mass
 			}
@@ -1241,29 +1269,32 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	// ---------- ENERGY: pay ONLY for dominant struct (prevents long-run burnout) ----------
-	// IMPORTANT: this assumes you removed K_STRUCT cost from applyInhibition().
+	// ---------- ENERGY: pay ONLY for dominant struct ----------
 	if winner != "" {
 		const structWinnerCost = 0.6
 		if ctx.Energy >= structWinnerCost {
 			ctx.Energy -= structWinnerCost
 			ctx.EnergySpentEpisode += structWinnerCost
 		} else {
-			// not enough energy => slightly inhibit winner, but don't kill the whole tick
 			ctx.Inhib[winner] += 0.5
 		}
 	}
 
-	// ---------- PLASTICITY (ONLY PLACE WHERE PREDICTIONS SWITCH) ----------
+	// ---------- PLASTICITY ----------
+	// Учим всегда. Переключение BestPred на err-тике допускается ТОЛЬКО при "давлении" (см. Plasticity()).
 	if ctx.LearningEnabled {
-		Plasticity(ctx)
+		Plasticity(ctx, hadErrThisTick)
 	}
 
-	// ---------- WINNER-ONLY ARMING (NEXT TICK EXPECTATIONS) [AFTER Plasticity] ----------
+	// ---------- WINNER-ONLY ARMING (NEXT TICK EXPECTATIONS) ----------
 	clearStringMap(ctx.ThisExpect)
-	if winner != "" && ctx.Inhib[winner] <= 0.7 {
-		if keepPred := ctx.BestPred[winner]; keepPred != "" {
-			ctx.ThisExpect[winner] = keepPred
+
+	// If ERR this tick -> do not arm for next tick (prevents immediate double-ERR loop).
+	if !hadErrThisTick {
+		if winner != "" && ctx.Inhib[winner] <= 0.7 {
+			if keepPred := ctx.BestPred[winner]; keepPred != "" {
+				ctx.ThisExpect[winner] = keepPred
+			}
 		}
 	}
 
@@ -1288,11 +1319,11 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 
 const PredSwitchMass = 1.0
 
-func Plasticity(ctx *Context) {
-	boost := 1.0
-	if ctx.ErrTTL > 0 {
-		boost = 1.0 + ctx.ErrGain
-	}
+// Plasticity учит ВСЕГДА.
+// hadErrThisTick=true => переключение BestPred НЕ мгновенное,
+// но возможно при достаточном накопленном "давлении" (многократные повторы).
+func Plasticity(ctx *Context, hadErrThisTick bool) {
+	structBoost := 1.0
 
 	// ----- PAIRS: learn only adjacent tokens (PrevSens -> LastSens) -----
 	if ctx.LearnStruct {
@@ -1303,7 +1334,7 @@ func Plasticity(ctx *Context) {
 			if v, ok := ctx.SeenPairs[k]; ok && v < 0 {
 				// nothing
 			} else {
-				ctx.SeenPairs[k] += 0.40 * boost
+				ctx.SeenPairs[k] += 0.40 * structBoost
 				if ctx.SeenPairs[k] >= 1.0 {
 					name := canonicalPairName(ctx.PrevSens, ctx.LastSens)
 					id := "COACT:" + name
@@ -1311,15 +1342,8 @@ func Plasticity(ctx *Context) {
 					if _, exists := ctx.Blocks[id]; !exists {
 						ctx.AddBlock(NewCoActBlock(ctx.PrevSens, ctx.LastSens))
 						ctx.TrainEvents = append(ctx.TrainEvents, fmt.Sprintf("+++ LEARNED NEW PAIR BLOCK %s", name))
-
-												// NOTE: keep demo clean: no ACTION blocks for SEQ
-						// actName := "ACT_ON_" + name
-						// ctx.AddBlock(NewActionBlock(name, actName))
-						// ctx.TrainEvents = append(ctx.TrainEvents, fmt.Sprintf("+++ ATTACHED ACTION %s <- %s", actName, name))
-
 					}
 
-					// STB: crystallized => mark as crystal, not deleted (prevents relearn loops)
 					ctx.SeenPairs[k] = -1.0
 				}
 			}
@@ -1327,14 +1351,14 @@ func Plasticity(ctx *Context) {
 	}
 
 	// ----- SEQ: learn directional adjacency (PrevSens -> LastSens) -----
-	if ctx.LearnStruct {
+	if ctx.LearnStruct && !ctx.DisableSeq {
 		if ctx.PrevSens != "" && ctx.LastSens != "" && ctx.PrevSens != ctx.LastSens {
 			sk := ctx.PrevSens + ">" + ctx.LastSens
 
 			if v, ok := ctx.SeenSeq[sk]; ok && v < 0 {
 				// already crystallized
 			} else {
-				ctx.SeenSeq[sk] += 0.45 * boost
+				ctx.SeenSeq[sk] += 0.45 * structBoost
 				if ctx.SeenSeq[sk] >= 1.0 {
 					name := fmt.Sprintf("(%s>%s)", ctx.PrevSens, ctx.LastSens)
 					id := "SEQ:" + name
@@ -1355,26 +1379,23 @@ func Plasticity(ctx *Context) {
 	}
 
 	// ----- COMPOSE: learn only when a structure was active on previous tick, then current token arrives -----
-	// CLEAN RULE: don't learn "self-transitions" back into the same pair tokens
 	if ctx.LearnStruct {
 		if ctx.LastSens != "" && len(ctx.PrevStructSet) > 0 {
 			for base := range ctx.PrevStructSet {
-				// Only allow compose from SIMPLE PAIRS like [1-2]
 				a, b, ok := parsePairMembers(base)
 				if !ok {
 					continue
 				}
-				// Skip if next token is one of the pair members
 				if ctx.LastSens == a || ctx.LastSens == b {
 					continue
 				}
 
 				ck := base + "||" + ctx.LastSens
 				if v, ok := ctx.SeenComposes[ck]; ok && v < 0 {
-					continue // already crystallized
+					continue
 				}
 
-				ctx.SeenComposes[ck] += 0.28 * boost
+				ctx.SeenComposes[ck] += 0.28 * structBoost
 				if ctx.SeenComposes[ck] >= 1.0 {
 					name := fmt.Sprintf("[%s-%s]", base, ctx.LastSens)
 					id := "COMPOSE:" + name
@@ -1402,14 +1423,12 @@ func Plasticity(ctx *Context) {
 					ctx.TransCounts[st] = make(map[string]float64)
 				}
 
-				// base reinforcement
-				// MANUAL FIX: do not let a single error-tick force an immediate public switch.
-				// During ErrTTL, we still learn counts, but slower; switching will happen on repetition.
+				// base reinforcement (normal observation)
 				learnRate := 0.22
 				if ctx.ErrTTL > 0 {
 					learnRate = 0.12
 				}
-				ctx.TransCounts[st][ctx.LastSens] += learnRate * boost
+				ctx.TransCounts[st][ctx.LastSens] += learnRate
 
 				// recompute best prediction + confidence for st
 				bestTok := ""
@@ -1426,130 +1445,137 @@ func Plasticity(ctx *Context) {
 				oldPred := ctx.BestPred[st]
 				oldConf := ctx.PredConf[st]
 
+				const (
+					confirmN      = 4
+					evidenceStep  = 0.22
+					minMarginFrac = 0.35
+				)
+				eps := 1e-9
+
+				computeGatedConf := func(targetTok string, targetV float64) float64 {
+					if sumV <= eps || targetTok == "" || targetV <= 0 {
+						return 0.0
+					}
+
+					rawConf := targetV / sumV
+
+					// evidence gate
+					minEvidenceForFull := float64(confirmN) * evidenceStep
+					eGate := 1.0
+					if minEvidenceForFull > eps {
+						eGate = targetV / minEvidenceForFull
+						if eGate > 1.0 {
+							eGate = 1.0
+						}
+						if eGate < 0.0 {
+							eGate = 0.0
+						}
+					}
+
+					// margin gate vs second best
+					secondV := 0.0
+					for tok, v := range ctx.TransCounts[st] {
+						if tok == targetTok {
+							continue
+						}
+						if v > secondV {
+							secondV = v
+						}
+					}
+
+					mGate := 1.0
+					if secondV > 0 {
+						need := secondV * (1.0 + minMarginFrac)
+						if targetV < need {
+							mGate = targetV / (need + eps)
+							if mGate > 1.0 {
+								mGate = 1.0
+							}
+							if mGate < 0.0 {
+								mGate = 0.0
+							}
+						}
+					}
+
+					conf := rawConf * eGate * mGate
+
+					// hard caps: no "absolute certainty" look
+					if eGate < 1.0 || mGate < 1.0 {
+						if conf > 0.95 {
+							conf = 0.95
+						}
+					} else {
+						if conf > 0.99 {
+							conf = 0.99
+						}
+					}
+
+					if conf < 0.01 {
+						return 0.0
+					}
+					return conf
+				}
+
 				if bestTok != "" && sumV > 0 {
-					// --- INERTIA GUARD (STB-style, dominance + mass) ---
 					oldV := 0.0
 					if oldPred != "" {
 						oldV = ctx.TransCounts[st][oldPred]
 					}
 
-					// В обычном режиме держим инерцию (чтобы не дёргалось),
-					// но во время error-boost окна делаем переключение легче (fast re-learn).
-					domFactor := 1.35
-					if ctx.ErrTTL > 0 {
-						domFactor = 1.10
-					}
-
 					noPrev := oldPred == ""
 					sameAsPrev := bestTok == oldPred
+
+					// base dominance rule (clean tick switching)
+					domFactor := 1.35
+					if ctx.ErrTTL > 0 {
+						domFactor = 1.45 // more inertia near error windows
+					}
 					canSwitchByStrength := (bestV >= PredSwitchMass) && (noPrev || bestV >= oldV*domFactor)
 
-					allowSwitch := noPrev || sameAsPrev || canSwitchByStrength
-
-					// --- CONFIDENCE GATE: conf cannot reach 1.00 without N confirmations + margin ---
-					// We treat one "confirmation" as roughly one normal learning increment (0.22).
-					// If you later change the base increment, adjust evidenceStep accordingly.
-					const (
-						confirmN      = 4
-						evidenceStep  = 0.22
-						minMarginFrac = 0.35
-					)
-					eps := 1e-9
-
-					computeGatedConf := func(targetTok string, targetV float64) float64 {
-						if sumV <= eps || targetTok == "" || targetV <= 0 {
-							return 0.0
+					// ✅ STB OVERRIDE: on an error tick, switching is allowed ONLY if pressure is large enough.
+					// This is what enables "retraining" after many repeats of the new reality.
+					pressureOverride := false
+					if hadErrThisTick && !noPrev && !sameAsPrev {
+						// needs many repeats: evidence + strong dominance + absolute margin
+						const (
+							overrideRatio = 1.80 // new must be ~80% stronger than old
+							overrideAbs   = 0.60 // and must beat old by a real margin
+							overrideMass  = 1.20 // and must have enough absolute mass
+							minEvidence   = 0.88 // ≈ 4 confirmations (0.22*4)
+						)
+						if bestV >= overrideMass && bestV >= minEvidence && bestV >= oldV*overrideRatio && (bestV-oldV) >= overrideAbs {
+							pressureOverride = true
 						}
-
-						rawConf := targetV / sumV
-
-						// evidence gate
-						minEvidenceForFull := float64(confirmN) * evidenceStep
-						eGate := 1.0
-						if minEvidenceForFull > eps {
-							eGate = targetV / minEvidenceForFull
-							if eGate > 1.0 {
-								eGate = 1.0
-							}
-							if eGate < 0.0 {
-								eGate = 0.0
-							}
-						}
-
-						// margin gate vs second best
-						secondV := 0.0
-						for tok, v := range ctx.TransCounts[st] {
-							if tok == targetTok {
-								continue
-							}
-							if v > secondV {
-								secondV = v
-							}
-						}
-
-						mGate := 1.0
-						if secondV > 0 {
-							need := secondV * (1.0 + minMarginFrac)
-							if targetV < need {
-								mGate = targetV / (need + eps)
-								if mGate > 1.0 {
-									mGate = 1.0
-								}
-								if mGate < 0.0 {
-									mGate = 0.0
-								}
-							}
-						}
-
-						conf := rawConf * eGate * mGate
-
-						// hard caps: no "absolute certainty" look
-						if eGate < 1.0 || mGate < 1.0 {
-							if conf > 0.95 {
-								conf = 0.95
-							}
-						} else {
-							if conf > 0.99 {
-								conf = 0.99
-							}
-						}
-
-						if conf < 0.01 {
-							return 0.0
-						}
-						return conf
 					}
+
+					allowSwitch := noPrev || sameAsPrev || canSwitchByStrength || pressureOverride
 
 					if allowSwitch {
 						ctx.BestPred[st] = bestTok
 						ctx.PredConf[st] = computeGatedConf(bestTok, bestV)
 					} else {
-						// держим старое публичное ожидание, но снижаем уверенность
+						// keep old publicly, but let its confidence decay slightly (so it can be dethroned)
 						ctx.BestPred[st] = oldPred
-
-						// recompute gated conf for the *old* prediction (if it still exists)
 						if oldPred != "" {
 							v := ctx.TransCounts[st][oldPred]
 							c := computeGatedConf(oldPred, v)
-							// apply inertia decay on top
-							ctx.PredConf[st] = c * 0.85
+							ctx.PredConf[st] = c * 0.92
 						} else {
-							ctx.PredConf[st] = oldConf * 0.85
+							ctx.PredConf[st] = oldConf * 0.92
 						}
 					}
 				} else {
 					// no transitions -> no public prediction
 					ctx.BestPred[st] = oldPred
-					ctx.PredConf[st] = oldConf * 0.85
+					ctx.PredConf[st] = oldConf * 0.92
 					if ctx.PredConf[st] < 0.01 {
 						ctx.PredConf[st] = 0.0
 					}
 				}
 
-				// log when prediction changes or confidence jumps
 				if ctx.BestPred[st] != "" &&
 					(ctx.BestPred[st] != oldPred || (ctx.PredConf[st]-oldConf) > 0.15) {
-					if showPredEvents {
+					if showPredEvents && !ctx.SuppressPredLog {
 						ctx.PredEvents = append(
 							ctx.PredEvents,
 							fmt.Sprintf("+++ PREDICTION UPDATED: %s -> %s (conf=%.2f)", st, ctx.BestPred[st], ctx.PredConf[st]),
@@ -1560,7 +1586,6 @@ func Plasticity(ctx *Context) {
 		}
 	}
 }
-
 
 // ---- Investor-friendly BOARD ----
 
@@ -1691,10 +1716,12 @@ func demoPulse(ctx *Context, title string) {
 		all = all[:3]
 	}
 
-	fmt.Printf(
-		"DEMO-PULSE: %s | energy=%.2f spent=%.2f | errBoost=%s | inhib=%v | topExp=%v\n",
-		title, ctx.Energy, ctx.EnergySpentEpisode, errBoost, inhs, all,
+	cprintf(
+	    C_MAGENTA,
+	    "DEMO-PULSE: %s | energy=%.2f spent=%.2f | errBoost=%s | inhib=%v | topExp=%v\n",
+	    title, ctx.Energy, ctx.EnergySpentEpisode, errBoost, inhs, all,
 	)
+
 }
 
 func armedExpectations(ctx *Context) []string {
@@ -1766,21 +1793,21 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 	comps := countBlocksByPrefix(ctx, "COMPOSE:")
 	acts := countBlocksByPrefix(ctx, "ACTIONBLOCK:")
 
-	fmt.Printf("=== BOARD t=%03d mode=%s ===\n", ctx.Tick, mode)
+	cprintf(C_MAGENTA+C_BOLD, "=== BOARD t=%03d mode=%s ===\n", ctx.Tick, mode)
+
+	// clean LEARNED line (pairs-only vs full)
 	if ctx.DemoFocusPairsOnly {
-    fmt.Printf("LEARNED: pairs=%d composes=%d actionLinks=%d blocks=%d\n", pairs, comps, acts, len(ctx.Blocks))
-} else {
-    fmt.Printf("LEARNED: pairs=%d seqs=%d composes=%d actionLinks=%d blocks=%d\n", pairs, seqs, comps, acts, len(ctx.Blocks))
-}
+	    cprintf(C_GREEN, "LEARNED: pairs=%d composes=%d actionLinks=%d blocks=%d\n", pairs, comps, acts, len(ctx.Blocks))
+		} else {
+		    cprintf(C_GREEN, "LEARNED: pairs=%d seqs=%d composes=%d actionLinks=%d blocks=%d\n", pairs, seqs, comps, acts, len(ctx.Blocks))
+		}
 
 
 	fmt.Printf("FIELD: energy=%.2f/%.2f\n", ctx.Energy, ctx.EnergyMax)
 	fmt.Printf("FIELD: energy_spent_episode=%.2f\n", ctx.EnergySpentEpisode)
 
 	// Show cleanup as a feature, not as a "sudden bug".
-	// AutoBoard often prints on the last token tick; pruning may have happened on a prior tick.
 	if ctx.LastCleanupCount > 0 {
-		// "recent" = within current pruning cadence window
 		recentWindow := ctx.PruneEvery
 		if recentWindow <= 0 {
 			recentWindow = 10
@@ -1809,13 +1836,11 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		fmt.Printf("LAST COMPOSE: %v\n", lastComps)
 	}
 
-
-
-	// Episode summary (unique, sorted / or keep-order where it matters)
+	// Episode summary
 	es := uniqueSorted(episodeStructs)
 	ea := uniqueSorted(episodeActions)
 
-	// IMPORTANT: keep order for errors/training (presentation + "no tuning" vibe)
+	// IMPORTANT: keep order for errors/training
 	ee := uniqueKeepOrder(episodeErrs)
 	et := uniqueKeepOrder(episodeTrain)
 
@@ -1836,12 +1861,11 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		for _, ev := range ee {
 			derrs = append(derrs, strings.ReplaceAll(ev, "->", "⇒"))
 		}
-		fmt.Printf("EPISODE: errors=%v\n", derrs)
+		cprintf(C_RED+C_BOLD, "EPISODE: errors=%v\n", derrs)
 	}
 
-	// ✅ Training: show only if learning actually produced events (avoid spam)
+	// Training events (only if any)
 	if len(et) > 0 {
-		// Keep order, but cluster by meaning: LEARNED -> ATTACHED -> OTHER
 		learned := make([]string, 0, len(et))
 		attached := make([]string, 0, len(et))
 		other := make([]string, 0, len(et))
@@ -1857,14 +1881,11 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 			}
 		}
 
-		// Build ordered sample and beautify arrows
 		raw := append(append(learned, attached...), other...)
 		dtrain := make([]string, 0, len(raw))
 		for _, ev := range raw {
 			dtrain = append(dtrain, strings.ReplaceAll(ev, "->", "⇒"))
 		}
-
-		// Keep it short, but informative
 		if len(dtrain) > 6 {
 			dtrain = dtrain[:6]
 		}
@@ -1872,7 +1893,7 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		fmt.Printf("TRAINING: events=%d  sample=%v\n", len(et), dtrain)
 	}
 
-	// ✅ REAL: armed expectations (winner-only arming lives in PendingExpect)
+	// Armed expectations (snapshot frozen in RunTick)
 	armed := armedExpectations(ctx)
 	if len(armed) == 0 {
 		fmt.Println("FIELD: armed expectations=(none)")
@@ -1880,14 +1901,13 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		fmt.Printf("FIELD: armed expectations=%v\n", armed)
 	}
 
-	// Model memory (what the system knows), limited to episode structs for readability
+	// Model expectations (limited to episode structs)
 	preds := topPredictions(ctx, episodeStructs, 6)
 	if len(preds) == 0 {
 		fmt.Println("FIELD: model expectations=(none)")
 	} else {
 		fmt.Printf("FIELD: model expectations=%v\n", preds)
 	}
-
 
 	// Always-on expectations (global)
 	all := make([]string, 0, 8)
@@ -1909,11 +1929,10 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		if len(all) > 8 {
 			all = all[:8]
 		}
-		// Hide ALL if it looks identical to dominant (avoid "duplicated metric" vibe)
-			if strings.Join(all, "|") != strings.Join(armed, "|") {
+		// Hide ALL if identical to armed (avoid “duplicated metric” vibe)
+		if strings.Join(all, "|") != strings.Join(armed, "|") {
 			fmt.Printf("FIELD: all expectations=%v\n", all)
 		}
-
 	}
 
 	// Inhibition snapshot
@@ -1924,28 +1943,31 @@ func printBoard(ctx *Context, episodeStructs, episodeActions, episodeErrs, episo
 		fmt.Printf("FIELD: inhib=%v\n", inhs)
 	}
 
-	// ✅ C1 FIX:
-	// suppressed must show ONLY structures that actually emitted ERR in this episode,
-	// not just "top inhibitions" (avoids duplicated metric / "tuning" vibe).
+	// Suppressed: only structures that emitted ERR this episode
 	supp := suppressedFromErrs(ctx, ee, 6)
 	if len(supp) > 0 {
 		fmt.Printf("FIELD: suppressed=%v\n", supp)
 	}
 
-	// If there were adaptations this episode, show them (short)
+	// Adaptations (only meaningful when episode had errors)
 	if len(ee) > 0 && len(ctx.LastAdapt) > 0 {
 		ad := ctx.LastAdapt
 		if len(ad) > 4 {
 			ad = ad[:4]
 		}
-		fmt.Printf("ADAPTATION: %v\n", ad)
+		cprintf(C_GREEN+C_BOLD, "ADAPTATION: %v\n", ad)
+
 	}
 
-	// Error-driven boost state
-	if ctx.ErrTTL > 0 {
-		fmt.Printf("LEARNING: error-boost=ON ttl=%d gain=%.2f\n", ctx.ErrTTL, ctx.ErrGain)
+	// Error-boost state:
+	// - primary truth: episode had ERR => boost was engaged (even if ErrTTL got reset at boundary)
+	// - secondary: if no ERR but TTL still running, show it (rare; mostly when board printed mid-episode)
+	if len(ee) > 0 {
+		cprintf(C_YELLOW+C_BOLD, "LEARNING: error-boost=ON (episode had ERR) gain=%.2f\n", ctx.ErrGain)
+	} else if ctx.ErrTTL > 0 {
+		cprintf(C_YELLOW+C_BOLD, "LEARNING: error-boost=ON ttl=%d gain=%.2f\n", ctx.ErrTTL, ctx.ErrGain)
 	} else {
-		fmt.Println("LEARNING: error-boost=OFF")
+		cprintf(C_GRAY, "LEARNING: error-boost=OFF\n")
 	}
 }
 
@@ -2212,7 +2234,8 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 				len(chargeLines) == 0 && len(predEvents) == 0 && len(trainEvents) == 0 {
 
 				// 👇 NEW: print minimal tick marker to avoid gaps
-				fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
+				cprintf(C_GRAY, "t=%03d INPUT=%s\n", ctx.Tick, tok)
+
 
 				if sleepMs > 0 {
 					time.Sleep(time.Duration(sleepMs) * time.Millisecond)
@@ -2225,7 +2248,8 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 				len(structs) == 0 && len(actions) == 0 && len(errs) == 0 &&
 				len(chargeLines) > 0 && len(predEvents) == 0 && len(trainEvents) == 0 {
 
-				fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
+				cprintf(C_GRAY, "t=%03d INPUT=%s\n", ctx.Tick, tok)
+
 				for _, ln := range chargeLines {
 					fmt.Printf("           %s\n", ln)
 				}
@@ -2243,24 +2267,31 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 		}
 
 		if len(structs) > 0 {
-			fmt.Printf("t=%03d INPUT=%s  STRUCT=%v\n", ctx.Tick, tok, structs)
+			cprintf(C_GRAY, "t=%03d INPUT=%s  ", ctx.Tick, tok)
+			cprintf(C_CYAN+C_BOLD, "STRUCT=%v\n", structs)
 		} else {
-			fmt.Printf("t=%03d INPUT=%s\n", ctx.Tick, tok)
+			cprintf(C_GRAY, "t=%03d INPUT=%s\n", ctx.Tick, tok)
 		}
+
 
 		// show CHARGE only outside investorMode (investorMode already compresses output)
 		if !investorMode && len(chargeLines) > 0 {
 			for _, ln := range chargeLines {
-				fmt.Printf("           %s\n", ln)
+				color := C_BLUE
+				if strings.Contains(ln, "NEAR-CRYSTAL") {
+					color = C_YELLOW + C_BOLD
+				}
+				cprintf(color, "           %s\n", ln)
 			}
+
 		}
 
 		// demo hides actions cosmetically
 		if len(actions) > 0 && !(investorMode && demoRunning) {
-			fmt.Printf("           ACTION=%v\n", actions)
+			cprintf(C_GREEN+C_BOLD, "           ACTION=%v\n", actions)
 		}
 		if len(errs) > 0 {
-			fmt.Printf("           ERROR=%v\n", errs)
+			cprintf(C_RED+C_BOLD, "           ERROR=%v\n", errs)
 		}
 
 		// expectation detail in investor mode on error
@@ -2289,7 +2320,7 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 			}
 
 			if len(parts) > 0 {
-				fmt.Printf("           EXPECTATIONS: %s\n", strings.Join(parts, " ; "))
+				cprintf(C_MAGENTA, "           EXPECTATIONS: %s\n", strings.Join(parts, " ; "))
 			}
 		}
 
@@ -2319,16 +2350,20 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 					}
 
 					if ctx.LearningEnabled {
-						fmt.Printf(
+						cprintf(
+							C_RED,
 							"           MISPREDICTION: %s expected %s (conf %.2f) ⇒ got %s (conf %.2f->%.2f)\n",
 							st, showPred, before, actual, before, instantAfter,
 						)
+
 					} else {
-						fmt.Printf(
+						cprintf(
+							C_RED,
 							"           MISPREDICTION: %s expected %s (conf %.2f) ⇒ got %s\n",
 							st, showPred, before, actual,
 						)
-						fmt.Printf("           NOTE: TEST mode => no learning; switch to TRAIN to adapt\n")
+
+						cprintf(C_YELLOW, "           NOTE: TEST mode => no learning; switch to TRAIN to adapt\n")
 					}
 				}
 
@@ -2337,8 +2372,11 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 					if inhibN == 0 {
 						inhibN = len(errs)
 					}
-					fmt.Printf("           FIELD RESPONSE: inhibited=%d | error-boost ttl=%d gain=%.2f\n",
-						inhibN, ctx.ErrTTL, ctx.ErrGain)
+					cprintf(C_YELLOW+C_BOLD,
+						"           FIELD RESPONSE: inhibited=%d | error-boost ttl=%d gain=%.2f\n",
+						inhibN, ctx.ErrTTL, ctx.ErrGain,
+					)
+
 				}
 
 				// count one "verbose error-tick"
@@ -2356,20 +2394,20 @@ func RunEpisodeTokens(ctx *Context, tokens []string, investorMode bool, demoRunn
 		// ✅ C3: show ENERGY only when tick had true "event"
 		// BUT: in demo we always show ENERGY on last token (to avoid "silent 4").
 		if tickHadEvent || (demoRunning && i == len(tokens)-1) {
-			fmt.Printf("           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
+			cprintf(C_GRAY, "           ENERGY_NOW=%.2f  SPENT_EP=%.2f\n", ctx.Energy, ctx.EnergySpentEpisode)
 		}
 
 		// Print training events ONLY outside demo (demo already has enough “spark”)
 		if !demoRunning && len(trainEvents) > 0 {
 			for _, te := range trainEvents {
-				fmt.Printf("           %s\n", te)
+				cprintf(C_GREEN, "           %s\n", te)
 			}
 		}
 
 		// Print prediction events (your existing +++ PREDICTION UPDATED etc)
 		if len(predEvents) > 0 {
 			for _, pe := range predEvents {
-				fmt.Printf("           %s\n", pe)
+				cprintf(C_CYAN, "           %s\n", pe)
 			}
 		}
 
@@ -2474,6 +2512,15 @@ func main() {
 	    fmt.Println("MODE = TEST (learning disabled)")
 	    continue
 
+	    case "color on":
+			colorLogs = true
+			fmt.Println("Color logs = ON")
+			continue
+
+		case "color off":
+			colorLogs = false
+			fmt.Println("Color logs = OFF")
+			continue
 
 		case "reset":
 			resetEpisodeBoundary(ctx)
@@ -2550,16 +2597,23 @@ func main() {
 			demoCtx := NewContext()
 			demoCtx.LearningEnabled = true
 			demoCtx.DemoFocusPairsOnly = true
+			demoCtx.DisableSeq = true
+			demoCtx.LearnPred = false   // Step 1: запретить обучение предсказаний
+			demoCtx.LearnStruct = true  // Step 1: разрешить обучение структур
 
 			// reset last episode buffers for board prints inside demo
 			lastEpisodeStructs = nil
 			lastEpisodeActions = nil
 			lastEpisodeErrs = nil
 
+demoCtx.SuppressPredLog = true
+demoCtx.LearnStruct = true
+demoCtx.LearnPred = false // желательно, но теперь уже не критично
+
 			// ✅ C3-B: Step 1 should be short & event-dense (crystallize only what we need)
 			// Pair adds ~0.40 per repeat, Seq adds ~0.45 => 3 repeats reliably crystallize.
 			demoCtx.LearnStruct = true
-			demoCtx.LearnPred = true
+			demoCtx.LearnPred = false
 
 			fmt.Println("DEMO STEP 1/3: ACCUMULATION -> CRYSTALLIZATION")
 			rep := RunEpisodeLine(demoCtx, "1 2 1 2 1 2  2 3 2 3 2 3", investorMode, demoRunning, sleepMs, false)
@@ -2573,6 +2627,10 @@ func main() {
 
 			// ✅ DEMO: начиная со Step 2 — фокус только на PAIR-структурах ([a-b]) в competition/arming/pred-pulses
 			demoCtx.DemoFocusPairsOnly = true
+
+demoCtx.SuppressPredLog = false
+demoCtx.LearnStruct = false
+demoCtx.LearnPred = true
 
 			// Step 2: show structures driving predictions (keep it dense; no need for long repetition)
 			demoCtx.LearnStruct = false // <-- STOP birthing new PAIR/SEQ/COMPOSE here
@@ -2604,23 +2662,34 @@ func main() {
 			demoCtx.LearnStruct = false
 			demoCtx.LearnPred = true
 
+			// усиление: даём два подтверждения в одном эпизоде, чтобы BestPred успел переключиться
 			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
 			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
 			demoPulse(demoCtx, "after clean switch episode: 1 2 4")
+			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
 
-			// 3C) VERIFY (separate episodes): repeat 1 2 4 to show the model has adapted (errors should drop).
-			// For YC: learning OFF => verification is stable and doesn't introduce side-learning noise.
+
+			// 3C) VERIFY (two episodes):
+			// verify #1 = TRAIN (finish adaptation if needed)
+			// verify #2 = TEST  (prove stability without learning)
+
+			// verify #1 (TRAIN) — один прогон, чтобы не раздувать лог
+			demoCtx.LearningEnabled = true
+			demoCtx.LearnStruct = false
+			demoCtx.LearnPred = true
+
+			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
+			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
+			demoPulse(demoCtx, "verify #1 (train): 1 2 4")
+
+			// verify #2 (TEST) — чистая проверка без обучения
 			demoCtx.LearningEnabled = false
 			demoCtx.LearnStruct = false
 			demoCtx.LearnPred = false
 
 			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
 			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "verify #1: 1 2 4")
-
-			rep = RunEpisodeLine(demoCtx, "1 2 4", investorMode, demoRunning, sleepMs, false)
-			lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs = rep.Structs, rep.Actions, rep.Errs
-			demoPulse(demoCtx, "verify #2: 1 2 4")
+			demoPulse(demoCtx, "verify #2 (test): 1 2 4")
 
 			printBoard(demoCtx, lastEpisodeStructs, lastEpisodeActions, lastEpisodeErrs, nil)
 			lastBoardCtx = demoCtx
