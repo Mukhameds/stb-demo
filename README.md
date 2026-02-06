@@ -239,3 +239,16 @@ We are building **an architecture that makes adaptive AI with long-term memory e
 > **STB is an adaptive signal-based AI architecture that transforms AI from a costly inference service into a scalable, controllable, long-lived system.**
 
 ---
+
+## What the Demo Demonstrates
+
+The STB-DEMO is intentionally minimal.
+
+It demonstrates:
+- how predictions emerge from internal structure rather than inference;
+- how errors trigger structural adaptation instead of retraining;
+- how competing hypotheses are inhibited and forgotten over time;
+- how behavior stabilizes without datasets or external supervision.
+
+The demo is not task-optimized.
+It exists to validate the architectural principles.
