@@ -1,196 +1,192 @@
 
 ---
 
-# **STB ARA — an architecture that makes AI businesses economically viable and socially useful**
+# **STB ARA — an adaptive AI system architecture, not a model**
 
 **Founder:** Mukhamed Satybaev
-
----
-
 **Stage:** Working prototype / Demo
+**Category:** AI / Systems / Infrastructure
+
+> **STB is a non-neural AI architecture that learns, predicts, and adapts
+> without datasets, retraining, or constant inference.**
 
 ---
 
-**Category:** AI / Systems / Infrastructure
+## Quick Demo (2 minutes)
+
+```bash
+go run main.go
+```
+
+Then:
+
+* type `demo` to see a scripted scenario
+  **or**
+* manually input: `A B C` several times, then `A B Z`
+
+Observe how the system:
+
+* forms internal structures,
+* makes predictions,
+* detects mispredictions,
+* adapts behavior **without retraining or datasets**.
+
+This demo is intentionally minimal.
+It exists to validate the **architecture**, not to solve a task.
+
+---
+
+## What this is NOT
+
+* not an LLM wrapper
+* not a prompt framework
+* not a neural model
+* not trained on datasets
+
+**STB is a system architecture, not a model.**
 
 ---
 
 ## Problem
 
-AI products built on large neural network models face **structural business problems**, whose root cause lies **in the architecture of modern AI systems**, not in temporary growth challenges.
+AI products built on large neural network models face **structural business problems** rooted in **architecture**, not execution or market timing.
 
 Modern AI is implemented as:
 
-* a static model;
+* a static trained model;
 * accessed via API;
-* with inference as the primary operation;
+* with inference as the core operation;
 * with training separated from execution.
 
-As usage scales, this leads to systemic effects:
+As usage scales, this architecture produces systemic effects:
 
-* inference becomes a constant variable cost per request;
+* inference becomes a permanent variable cost per request;
 * margins decline with scale instead of increasing;
-* products are tightly dependent on external AI platforms that control pricing, limits, and policies;
-* differentiation disappears as competitors rely on the same base models;
-* system behavior remains stochastic and difficult to formally validate;
-* personalization requires storing and processing increasing amounts of context, sharply raising costs;
-* privacy and compliance requirements complicate architecture and slow enterprise adoption;
-* retraining and fine-tuning require global operations and do not scale economically.
+* products depend on external platforms that control pricing and limits;
+* differentiation collapses as competitors use the same base models;
+* system behavior remains stochastic and hard to validate;
+* personalization requires growing context and rising costs;
+* privacy and compliance slow enterprise adoption;
+* retraining and fine-tuning require global, expensive operations.
 
-From an engineering perspective, businesses are attempting to use **a model as a system**,
-and **inference as a stable computational process**, for which this architecture was never designed.
+From an engineering perspective, businesses are attempting to use
+**a model as a system**,
+and **inference as a stable computational process**.
 
 **Result:**
-most AI startups become structurally unprofitable, fragile, and undefended—regardless of traction or product quality.
+Most AI startups become structurally unprofitable, fragile, and undefended —
+regardless of traction or product quality.
 
 ---
 
 ## Insight
 
-All of these problems share a common source.
+All of these problems share a single root cause.
 
 > **Modern AI is built as a model,
 > while businesses need AI systems.**
 
 Neural networks are optimized offline and executed as services.
-Businesses, however, require **long-lived, adaptive, controllable systems** that accumulate experience over time.
+Businesses require **long-lived, adaptive, controllable systems** that accumulate experience over time.
 
-This is not a tooling problem.
+This is not a tooling issue.
 It is an **architectural mismatch**.
 
 ---
 
 ## Solution
 
-**STB (Signal Theory of Being)** is an alternative AI architecture designed as a **continuous adaptive system**, rather than a model inference pipeline.
+**STB (Signal Theory of Being)** is an alternative AI architecture designed as a
+**continuous adaptive system**, not an inference pipeline.
 
-STB implements intelligence as continuous signal dynamics:
+STB represents intelligence as signal dynamics:
 
 ```
 Signal → Block → Reaction → Signal*
 ```
 
-where:
+Where:
 
-* **Signal** is a discrete external or internal event carrying context;
-* **Block** is an autonomous functional element that reacts to signals;
-* **Reaction** is a local computational event that changes state and produces new signals.
+* **Signal** — a discrete external or internal event carrying context;
+* **Block** — an autonomous functional element that reacts to signals;
+* **Reaction** — a local computation that updates state and emits new signals.
 
-Cascades of these local reactions determine overall system behavior.
+System behavior emerges from competing cascades of local reactions.
 
 As a result:
 
-* local signal reactions replace constant inference;
-* behavior emerges from competing reactive cascades;
-* system structure continuously evolves based on experience;
-* external models (LLMs) are used as tools, not as the core.
+* local reactions replace constant inference;
+* structure evolves continuously with experience;
+* memory, prediction, and forgetting are intrinsic;
+* external models (LLMs) become optional tools, not the core.
 
-STB transforms AI from a costly service
-into an **economically scalable system**.
+**STB transforms AI from a costly service into a scalable system.**
 
 ---
 
 # How STB Solves Business Pain
 
-## 1. Eliminating constant inference as the basis of computation
+## 1. Eliminating inference as the basis of computation
 
 ### Architectural mechanism
 
-STB makes decisions through **local signal reactions**.
-Computation occurs on events, not per request.
-External models (including LLMs) are **optional accelerators**, not part of the core cycle.
-
-### Business pains addressed
-
-* non-converging unit economics
-* rising COGS with scale
-* energy and ESG risks
+Decisions arise from **local signal reactions**.
+Computation happens on events, not per request.
 
 ### Business impact
 
 * 10–100× lower COGS
 * margins increase with scale
-* AI stops being a GPU-dependent service
+* reduced GPU dependency
 
 ---
 
-## 2. Moving intelligence from the cloud into the system itself
+## 2. Moving intelligence into the system itself
 
 ### Architectural mechanism
 
-Intelligence is implemented as a **long-lived signal structure**
-that operates locally (edge-first), autonomously, and continuously.
-
-### Business pains addressed
-
-* vendor lock-in
-* lack of autonomy
-* inability to operate offline / edge / mesh
-* privacy and compliance challenges
+Intelligence exists as a **long-lived internal structure**, operating locally and continuously.
 
 ### Business impact
 
-* full architectural control
-* reduced platform risk
+* reduced vendor lock-in
+* offline / edge capability
 * compliance by design
 * access to new markets (IoT, field ops, defense)
 
 ---
 
-## 3. Deterministic and explainable system behavior
+## 3. Deterministic and explainable behavior
 
 ### Architectural mechanism
 
-Critical decisions are handled by **deterministic signal blocks**.
-Each decision is a **clear, traceable chain of signals and reactions**.
-
-### Business pains addressed
-
-* unpredictable quality
-* hallucinations
-* lack of explainability
-* inability to certify systems
+Decisions follow **traceable signal chains**, not probabilistic sampling.
 
 ### Business impact
 
 * predictable behavior
-* audit-ready systems
+* auditability
 * enterprise readiness
 
 ---
 
-## 4. Continuous evolution instead of training as an operation
+## 4. Continuous evolution without training cycles
 
 ### Architectural mechanism
 
-STB learns through **evolution of its own structure**:
+STB evolves through:
 
 * formation of new blocks;
 * reinforcement of stable ones;
-* degradation of unused ones.
+* degradation of unused structures.
 
-Without retraining, fine-tuning, or global operations.
-
-### Business pains addressed
-
-* high training costs
-* slow adaptation
-* fake personalization
-* lack of moat
+No retraining. No fine-tuning. No global operations.
 
 ### Business impact
 
-* fast and low-cost adaptation
+* fast adaptation
 * true personalization
 * architectural + behavioral moat
-* increased retention and LTV
-
----
-
-## Summary
-
-> **STB solves business pain not through individual features,
-> but by changing the architectural level of computation.**
 
 ---
 
@@ -212,10 +208,10 @@ It is a **new computational architecture**.
 
 ## Why Now
 
-* LLM costs are growing faster than the value they generate;
-* enterprise customers demand control, predictability, and compliance;
-* AI-wrapper products are rapidly commoditizing;
-* demand for edge and autonomous systems is increasing.
+* LLM costs are rising faster than value creation;
+* enterprises demand control, predictability, and compliance;
+* AI wrappers are rapidly commoditizing;
+* demand for autonomous and edge systems is increasing.
 
 The market needs **AI at the system level**, not just larger models.
 
@@ -228,27 +224,29 @@ STB enables AI products that:
 * scale economically;
 * remain under company control;
 * continuously evolve;
-* support long-lived autonomous intelligent systems.
+* support long-lived autonomous intelligence.
 
-We are building **an architecture that makes adaptive AI with long-term memory economically and technically viable**.
+We are building **an architecture that makes adaptive AI economically and technically viable**.
 
 ---
 
-## One-line Description
+## One-line Summary
 
-> **STB is an adaptive signal-based AI architecture that transforms AI from a costly inference service into a scalable, controllable, long-lived system.**
+> **STB is an adaptive signal-based AI architecture that replaces constant inference with continuous system-level intelligence.**
 
 ---
 
 ## What the Demo Demonstrates
 
-The STB-DEMO is intentionally minimal.
+The demo intentionally avoids task optimization.
 
 It demonstrates:
-- how predictions emerge from internal structure rather than inference;
-- how errors trigger structural adaptation instead of retraining;
-- how competing hypotheses are inhibited and forgotten over time;
-- how behavior stabilizes without datasets or external supervision.
 
-The demo is not task-optimized.
-It exists to validate the architectural principles.
+* how predictions emerge from internal structure;
+* how errors trigger adaptation instead of retraining;
+* how competing hypotheses are inhibited and forgotten;
+* how behavior stabilizes without datasets or supervision.
+
+**The goal is to validate the architecture — not to solve a benchmark.**
+
+---
