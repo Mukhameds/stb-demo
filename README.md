@@ -36,17 +36,6 @@ It exists to validate the **architecture**, not to solve a task.
 
 ---
 
-## What this is NOT
-
-* not an LLM wrapper
-* not a prompt framework
-* not a neural model
-* not trained on datasets
-
-**STB is a system architecture, not a model.**
-
----
-
 ## Problem
 
 AI products built on large neural network models face **structural business problems** rooted in **architecture**, not execution or market timing.
