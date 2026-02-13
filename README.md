@@ -1,7 +1,7 @@
 
 ---
 
-# **STB ARA — an adaptive AI system architecture, not a model**
+# **STB ARA — an adaptive AI system architecture**
 
 **Founder:** Mukhamed Satybaev
 **Stage:** Working prototype / Demo
