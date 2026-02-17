@@ -1,3 +1,37 @@
+/*
+STB Core Prototype
+This program runs a signal-based system.
+
+Signal:
+A small event object (Kind, Value, Mass, Time, From)
+that represents something happening in the system.
+
+Block:
+A processing unit that reacts to signals
+and may emit new signals.
+
+There is no central decision function.
+Each block reacts independently to incoming signals.
+New signals are produced by these reactions.
+
+During each tick:
+1.Incoming signals are processed.
+2.Blocks react locally.
+3.New signals are generated.
+4.Competing structures are compared by activation mass.
+5.The strongest structure influences the next state.
+
+Repeated co-activations create new blocks dynamically.
+Each learned structure keeps simple transition statistics
+to predict what signal may come next.
+
+Learning happens online and incrementally.
+Unused structures can be removed over time.
+
+Overall, this is a distributed signal-reaction system
+with local prediction and competitive selection.
+*/
+
 package main
 
 import (
@@ -68,39 +102,56 @@ func clearFloatMap(m map[string]float64) {
 	}
 }
 
+// Kind is the signal type. It defines how a Signal should be interpreted by blocks and the field.
 type Kind string
 
 const (
-	K_SENS   Kind = "SENS"   // sensory input token
-	K_ACT    Kind = "ACT"    // activation signal from a block
-	K_STRUCT Kind = "STRUCT" // learned structure signal
+	// External input
+	K_SENS Kind = "SENS" // raw input token
 
-	K_PRED  Kind = "PRED" // prediction: expects next sensory token
-	K_ERR   Kind = "ERR"  // prediction error (mismatch)
-	K_NOTE  Kind = "NOTE"
-	K_INHIB Kind = "INHIB" // inhibition (competition / suppression)
+	// Internal activations
+	K_ACT    Kind = "ACT"    // sensor activation (token recognized)
+	K_STRUCT Kind = "STRUCT" // learned structure activation (pair/seq/compose)
 
-	K_DRIVE  Kind = "DRIVE"  // (reserved) drive towards action (later)
-	K_ACTION Kind = "ACTION" // action output (visible)
+	// Prediction + feedback
+	K_PRED Kind = "PRED" // predicted next token (structure->token)
+	K_ERR  Kind = "ERR"  // prediction mismatch (structure expected X, got Y)
+
+	// Control signals
+	K_NOTE  Kind = "NOTE"  // debug/info marker (optional)
+	K_INHIB Kind = "INHIB" // inhibition marker (used for suppression/competition)
+
+	// Output
+	K_DRIVE  Kind = "DRIVE"  // reserved: action drive (future use)
+	K_ACTION Kind = "ACTION" // emitted action (observable output)
 )
 
+
+// Signal is the basic event unit flowing through the system.
+// It carries minimal information required for reaction and competition.
 type Signal struct {
-	Kind  Kind
-	Value string
-	Mass  float64
-	Time  int
-	From  string
+	Kind  Kind    // signal type (SENS, ACT, STRUCT, PRED, ERR, ACTION, etc.)
+	Value string  // token or structure identifier (e.g. "1", "[1-2]", "(1>2)")
+	Mass  float64 // activation strength used for competition (not a probability)
+	Time  int     // tick when the signal was emitted
+	From  string  // originating block ID (for tracing and learning updates)
 }
 
-
-
+// Block represents an independent processing unit.
+//
+// A block reacts to incoming signals and may emit new signals.
+// It does not control execution flow and has no global view of the system.
+// All coordination happens through signal exchange via Context.
 type Block interface {
 	ID() string
+
+	// React processes a single signal and may emit new signals immediately.
 	React(s Signal, ctx *Context) []Signal
+
+	// Tick allows time-based updates (decay, accumulation, cooldowns).
+	// It may also emit signals.
 	Tick(ctx *Context) []Signal
 }
-
-
 
 type Context struct {
 	Tick         int
@@ -694,24 +745,31 @@ func (ctx *Context) AllowActionThisTick() bool {
 }
 
 
+// applyInhibition adjusts signal strength before it propagates further.
+
+// It implements three mechanisms:
+// 1)Action rate limiting and energy cost
+// 2)Temporary error-based amplification
+// 3)Competitive inhibition between active structures
 func applyInhibition(ctx *Context, s Signal) Signal {
-	
+
+	// 1) Action gating + energy model 
+	// Only a limited number of actions can fire per tick.
+	// Each action consumes energy; low energy reduces its strength.
 	if s.Kind == K_ACTION {
-		
+
 		if !ctx.AllowActionThisTick() {
 			s.Mass = 0
 			return s
 		}
 
-		
-		
 		key := fmt.Sprintf("%d|%d|%s|%s", ctx.Tick, s.Kind, s.Value, s.From)
 		if ctx.CostedThisTick != nil && !ctx.CostedThisTick[key] {
 			ctx.CostedThisTick[key] = true
 
 			const cost = 0.8
 			if ctx.Energy < cost {
-				// not enough energy: dampen
+				// Not enough energy: dampen action strength.
 				s.Mass *= 0.3
 			} else {
 				ctx.Energy -= cost
@@ -720,13 +778,15 @@ func applyInhibition(ctx *Context, s Signal) Signal {
 		}
 	}
 
-	
-	
+	//  2) Error boost 
+	// Shortly after a prediction error, amplify STRUCT and PRED signals
+	// to accelerate adaptation.
 	if ctx.ErrTTL > 0 && (s.Kind == K_STRUCT || s.Kind == K_PRED) {
 		s.Mass *= (1.0 + ctx.ErrGain*0.5)
 	}
 
-	
+	// 3) Competitive inhibition 
+	// Only activation-bearing signals participate in inhibition.
 	if s.Kind != K_ACT && s.Kind != K_STRUCT {
 		return s
 	}
@@ -736,6 +796,7 @@ func applyInhibition(ctx *Context, s Signal) Signal {
 		return s
 	}
 
+	// Reduce mass proportionally to accumulated inhibition level.
 	s.Mass = s.Mass / (1.0 + lvl)
 	return s
 }
@@ -805,6 +866,12 @@ func preferStructName(a, b string) bool {
 	return a < b
 }
 
+// pruneOldBlocks removes inactive learned blocks to keep growth bounded.
+
+// The goal is practical:
+// -avoid unbounded accumulation of structures
+// -keep only structures that are recently useful (active or predictive)
+// -remove attached actions if their source structure is removed
 func pruneOldBlocks(ctx *Context) {
 	if ctx.ForgetAfter <= 0 {
 		return
@@ -812,8 +879,8 @@ func pruneOldBlocks(ctx *Context) {
 
 	kill := make(map[string]bool)
 
-	
-	
+	// ActionBlock IDs are encoded as: "ACTIONBLOCK:<actionName><-<targetStruct>"
+	// This helper extracts the target structure name.
 	getActionTarget := func(id string) string {
 		parts := strings.Split(id, "<-")
 		if len(parts) != 2 {
@@ -822,31 +889,30 @@ func pruneOldBlocks(ctx *Context) {
 		return parts[1]
 	}
 
-	
-	
+	// A structure is protected from pruning if it is:
+	// -predictive with decent confidence, or
+	// -has meaningful transition weights, or
+	// -was active very recently (this/previous tick window)
 	shouldProtectStruct := func(structName string) bool {
-		
 		if ctx.BestPred[structName] != "" && ctx.PredConf[structName] >= 0.30 {
 			return true
 		}
-		
+
 		if m, ok := ctx.TransCounts[structName]; ok && len(m) > 0 {
-			
 			for _, w := range m {
 				if w >= 0.20 {
 					return true
 				}
 			}
 		}
-		
+
 		if ctx.ThisStructSet[structName] || ctx.PrevStructSet[structName] {
 			return true
 		}
 		return false
 	}
 
-	
-	
+	// Extract structure name from learned block IDs.
 	getStructFromID := func(id string) string {
 		if strings.HasPrefix(id, "COACT:") {
 			return strings.TrimPrefix(id, "COACT:")
@@ -860,14 +926,15 @@ func pruneOldBlocks(ctx *Context) {
 		return ""
 	}
 
-	
+	// Step 1: mark stale learned structure blocks for deletion.
+	// BlockLastFire is updated when a block emits or is involved in activation.
 	for id, last := range ctx.BlockLastFire {
 		age := ctx.Tick - last
 		if age < ctx.ForgetAfter {
 			continue
 		}
 
-		
+		// Only prune learned structure producers (not sensors, not core logic).
 		if strings.HasPrefix(id, "COACT:") ||
 			strings.HasPrefix(id, "SEQ:") ||
 			strings.HasPrefix(id, "COMPOSE:") {
@@ -877,7 +944,7 @@ func pruneOldBlocks(ctx *Context) {
 				continue
 			}
 
-			
+			// Keep structures that are still useful.
 			if shouldProtectStruct(st) {
 				continue
 			}
@@ -886,8 +953,7 @@ func pruneOldBlocks(ctx *Context) {
 		}
 	}
 
-	
-	
+	// Step 2: if a structure producer is removed, remove its attached actions too.
 	if len(kill) > 0 {
 		for id := range ctx.Blocks {
 			if !strings.HasPrefix(id, "ACTIONBLOCK:") {
@@ -897,7 +963,6 @@ func pruneOldBlocks(ctx *Context) {
 			if target == "" {
 				continue
 			}
-			// kill action only if the corresponding struct producer was killed
 			if kill["COACT:"+target] || kill["SEQ:"+target] || kill["COMPOSE:"+target] {
 				kill[id] = true
 			}
@@ -908,8 +973,8 @@ func pruneOldBlocks(ctx *Context) {
 		return
 	}
 
-	
-	
+	// Safety cap: do not delete too many blocks in one cycle
+	// to avoid sudden behavior collapse.
 	const maxDeletesPerCycle = 6
 	if len(kill) > maxDeletesPerCycle {
 		type cand struct {
@@ -930,7 +995,7 @@ func pruneOldBlocks(ctx *Context) {
 		kill = trimmed
 	}
 
-	
+	// Apply deletions.
 	for id := range kill {
 		delete(ctx.Blocks, id)
 		delete(ctx.BlockLastFire, id)
@@ -938,7 +1003,7 @@ func pruneOldBlocks(ctx *Context) {
 	ctx.LastCleanupTick = ctx.Tick
 	ctx.LastCleanupCount = len(kill)
 
-	
+	// Keep execution order consistent after deletion.
 	newOrder := make([]string, 0, len(ctx.Order))
 	for _, id := range ctx.Order {
 		if kill[id] {
@@ -949,9 +1014,18 @@ func pruneOldBlocks(ctx *Context) {
 	ctx.Order = newOrder
 }
 
-// -
+/* RunTick executes one discrete step of the system.
+  The tick is driven purely by signals:
+incoming signals enter the field
+blocks react locally and emit new signals
+structures accumulate activation mass
+the strongest structure wins via competition
+the winner may arm an expectation for the next tick */
+
 func RunTick(ctx *Context, incoming []Signal) []Signal {
-	
+
+	//      Defensive initialization of runtime maps 
+
 	if ctx.Inhib == nil {
 		ctx.Inhib = make(map[string]float64)
 	}
@@ -971,7 +1045,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		ctx.PredConf = make(map[string]float64)
 	}
 
-	
 	if ctx.ThisStructSet == nil {
 		ctx.ThisStructSet = make(map[string]bool)
 	}
@@ -997,7 +1070,8 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		ctx.LastArmedConf = make(map[string]float64)
 	}
 
-	
+	//       Carry over expectations from previous tick 
+
 	for k := range ctx.LastArmedExpect {
 		delete(ctx.LastArmedExpect, k)
 	}
@@ -1009,15 +1083,13 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 			continue
 		}
 		ctx.LastArmedExpect[st] = tok
-		ctx.LastArmedConf[st] = ctx.PredConf[st] 
+		ctx.LastArmedConf[st] = ctx.PredConf[st]
 	}
 
-	
 	if ctx.PredEvents != nil {
 		ctx.PredEvents = ctx.PredEvents[:0]
 	}
 
-	
 	ctx.ActionsThisTick = 0
 	if ctx.MaxActionsPerTick <= 0 {
 		ctx.MaxActionsPerTick = 1
@@ -1025,39 +1097,38 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 
 	ctx.Tick++
 
-	
 	for k := range ctx.CostedThisTick {
 		delete(ctx.CostedThisTick, k)
 	}
 
 	ctx.WindowTrim(12)
 
-	
+	//      Energy regeneration (simple resource model) 
+
 	ctx.Energy += ctx.EnergyRegen
 	if ctx.Energy > ctx.EnergyMax {
 		ctx.Energy = ctx.EnergyMax
 	}
 
-	
+	//      Decay of inhibition and error cooldowns 
+
 	decayInhibition(ctx)
 	decayErrCooldown(ctx)
 	if ctx.ErrTTL > 0 {
 		ctx.ErrTTL--
 	}
 
-	
 	clearBoolMap(ctx.ThisStructSet)
 	clearFloatMap(ctx.ThisStructMass)
 	clearStringMap(ctx.ThisExpect)
 
-	
-	
-	
 	errSignals := make([]Signal, 0, 4)
-	hadErrThisTick := false 
-	
+	hadErrThisTick := false
 
-	
+	//      Prediction check 
+	// Compare actual sensory input with armed expectations.
+	// Mismatch produces ERR and updates transition statistics.
+
 	actual := ""
 	for _, s := range incoming {
 		if s.Kind == K_SENS {
@@ -1074,7 +1145,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 
 			inCooldown := ctx.ErrCooldown[st] > 0
 
-			
 			errSignals = append(errSignals, Signal{
 				Kind:  K_ERR,
 				Value: fmt.Sprintf("%s:%s->%s", st, pred, actual),
@@ -1083,13 +1153,11 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				From:  "FIELD:PRED",
 			})
 
-			
 			if ctx.LearningEnabled && ctx.LearnPred {
 				if _, ok := ctx.TransCounts[st]; !ok {
 					ctx.TransCounts[st] = make(map[string]float64)
 				}
 
-			
 				if w, ok := ctx.TransCounts[st][pred]; ok && w > 0 {
 					ctx.TransCounts[st][pred] = w * 0.92
 					if ctx.TransCounts[st][pred] < 0.05 {
@@ -1097,43 +1165,38 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 					}
 				}
 
-				
 				bump := 0.14
 				if inCooldown {
 					bump = 0.08
 				}
 				ctx.TransCounts[st][actual] += bump
 
-				
 				if ctx.TransCounts[st][actual] > 3.00 {
 					ctx.TransCounts[st][actual] = 3.00
 				}
 			}
 
-		
 			if !inCooldown {
 				hadErrThisTick = true
 
-				
 				ctx.ErrCooldown[st] = ctx.ErrCooldownTicks
-
-				
 				ctx.ErrTTL = 3
 
-				
+				// Suppress wrong expectation to force fast switching.
 				predKey := fmt.Sprintf("%s->%s", st, pred)
-				ctx.Inhib[predKey] += 0.6   // suppress wrong expectation strongly
-				ctx.Inhib[st] += 0.08       // tiny damping on struct (optional, prevents runaway spam)
+				ctx.Inhib[predKey] += 0.6
+				ctx.Inhib[st] += 0.08
 
-				
 				if ctx.PredEvents != nil {
-					ctx.PredEvents = append(ctx.PredEvents, fmt.Sprintf("ERR %s expected %s got %s", st, pred, actual))
+					ctx.PredEvents = append(ctx.PredEvents,
+						fmt.Sprintf("ERR %s expected %s got %s", st, pred, actual))
 				}
 			}
 		}
 	}
 
-	
+	//     Update sensory history 
+
 	for _, s := range incoming {
 		if s.Kind == K_SENS {
 			ctx.PrevSens = ctx.LastSens
@@ -1141,7 +1204,8 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	
+	//     Tick-based internal dynamics
+
 	emitted := make([]Signal, 0, 128)
 	for _, id := range ctx.Order {
 		out := ctx.Blocks[id].Tick(ctx)
@@ -1150,12 +1214,12 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	
 	queue := append([]Signal{}, incoming...)
 	queue = append(queue, errSignals...)
 	queue = append(queue, emitted...)
 
-	
+	//     Inject current model predictions into the field 
+
 	for st, tok := range ctx.BestPred {
 		conf := ctx.PredConf[st]
 		if tok == "" || conf < 0.25 {
@@ -1173,6 +1237,9 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
+	//      Multi-round propagation 
+	// Signals can trigger further reactions within the same tick.
+
 	const rounds = 4
 	allOut := make([]Signal, 0, 256)
 
@@ -1185,7 +1252,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 				continue
 			}
 
-			
 			if s.Kind == K_STRUCT || s.Kind == K_ACTION || s.Kind == K_ACT {
 				if s.From != "" {
 					if _, ok := ctx.Blocks[s.From]; ok {
@@ -1197,10 +1263,11 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 			if s.Kind == K_STRUCT {
 				ctx.RecentStruct = append(ctx.RecentStruct, s)
 
-				// Core field must not UI-filter structures.
+				// Accumulate activation mass for competition.
 				ctx.ThisStructSet[s.Value] = true
 				ctx.ThisStructMass[s.Value] += s.Mass
 
+				// Emit prediction if not strongly suppressed.
 				if ctx.Inhib[s.Value] <= 0.7 {
 					if pred := ctx.BestPred[s.Value]; pred != "" {
 						nextQueue = append(nextQueue, Signal{
@@ -1227,27 +1294,24 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		queue = nextQueue
 	}
 
-	
+	//        Competition result
+	// Select the strongest activated structure this tick.
+
 	winner := ""
 	wMass := 0.0
 
 	if len(ctx.ThisStructMass) > 0 {
 		const eps = 1e-9
 		for st, mass := range ctx.ThisStructMass {
-			if winner == "" {
-				winner, wMass = st, mass
-				continue
-			}
-			if mass > wMass+eps {
-				winner, wMass = st, mass
-				continue
-			}
-			if mass >= wMass-eps && preferStructName(st, winner) {
+			if winner == "" ||
+				mass > wMass+eps ||
+				(mass >= wMass-eps && preferStructName(st, winner)) {
 				winner, wMass = st, mass
 			}
 		}
 	}
 
+	// Inhibit competing structures to stabilize selection.
 	if winner != "" && len(ctx.ThisStructMass) > 1 {
 		for st, mass := range ctx.ThisStructMass {
 			if st == winner {
@@ -1261,7 +1325,7 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	
+	// Resource cost for selecting a winner.
 	if winner != "" {
 		const structWinnerCost = 0.6
 		if ctx.Energy >= structWinnerCost {
@@ -1272,15 +1336,13 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	
 	if ctx.LearningEnabled {
 		Plasticity(ctx, hadErrThisTick)
 	}
 
-	
 	clearStringMap(ctx.ThisExpect)
 
-	
+	// Arm next-tick expectation only if this tick had no error.
 	if !hadErrThisTick {
 		if winner != "" && ctx.Inhib[winner] <= 0.7 {
 			if keepPred := ctx.BestPred[winner]; keepPred != "" {
@@ -1289,7 +1351,6 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		}
 	}
 
-	
 	clearStringMap(ctx.PendingExpect)
 	for k, v := range ctx.ThisExpect {
 		ctx.PendingExpect[k] = v
@@ -1300,34 +1361,38 @@ func RunTick(ctx *Context, incoming []Signal) []Signal {
 		ctx.PrevStructSet[k] = true
 	}
 
-	
 	if ctx.PruneEvery > 0 && ctx.Tick%ctx.PruneEvery == 0 {
 		pruneOldBlocks(ctx)
 	}
 
-	
-
 	return allOut
 }
 
-
 const PredSwitchMass = 1.0
 
+// Plasticity performs online learning.
+// It has two responsibilities:
+// 1) Structural learning: create new blocks when repeated patterns reach a threshold.
+// 2) Predictive learning: update per-structure transition stats and choose the best next-token prediction.
 func Plasticity(ctx *Context, hadErrThisTick bool) {
 	structBoost := 1.0
+
+	// 1) Learn unordered co-activation pairs: [a-b] 
+	// When two different sensory tokens repeat adjacent enough times, we "crystallize" a CoActBlock.
 	if ctx.LearnStruct {
 		if ctx.PrevSens != "" && ctx.LastSens != "" && ctx.PrevSens != ctx.LastSens {
 			k := pairKey(ctx.PrevSens, ctx.LastSens)
 
-			
+			// SeenPairs[k] accumulates evidence. A negative value means "already crystallized".
 			if v, ok := ctx.SeenPairs[k]; ok && v < 0 {
-				
+
 			} else {
 				ctx.SeenPairs[k] += 0.40 * structBoost
 				if ctx.SeenPairs[k] >= 1.0 {
 					name := canonicalPairName(ctx.PrevSens, ctx.LastSens)
 					id := "COACT:" + name
 
+					// Crystallization point: enough evidence collected -> materialize a new block.
 					if _, exists := ctx.Blocks[id]; !exists {
 						ctx.AddBlock(NewCoActBlock(ctx.PrevSens, ctx.LastSens))
 						ctx.TrainEvents = append(ctx.TrainEvents, fmt.Sprintf("+++ LEARNED NEW PAIR BLOCK %s", name))
@@ -1339,19 +1404,22 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 		}
 	}
 
-	
+	// 2) Learn ordered transitions: (a>b) 
+	// Similar to pair learning, but preserves order. Can be disabled for demo clarity.
 	if ctx.LearnStruct && !ctx.DisableSeq {
 		if ctx.PrevSens != "" && ctx.LastSens != "" && ctx.PrevSens != ctx.LastSens {
 			sk := ctx.PrevSens + ">" + ctx.LastSens
 
+			// SeenSeq[sk] accumulates evidence. A negative value means "already crystallized".
 			if v, ok := ctx.SeenSeq[sk]; ok && v < 0 {
-				
+
 			} else {
 				ctx.SeenSeq[sk] += 0.45 * structBoost
 				if ctx.SeenSeq[sk] >= 1.0 {
 					name := fmt.Sprintf("(%s>%s)", ctx.PrevSens, ctx.LastSens)
 					id := "SEQ:" + name
 
+					// Crystallize a new SeqBlock and optionally attach a simple action link for the demo.
 					if _, exists := ctx.Blocks[id]; !exists {
 						ctx.AddBlock(NewSeqBlock(ctx.PrevSens, ctx.LastSens))
 						ctx.TrainEvents = append(ctx.TrainEvents, fmt.Sprintf("+++ LEARNED NEW SEQ BLOCK %s", name))
@@ -1367,7 +1435,8 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 		}
 	}
 
-	
+	//  3) Learn compositions: [base-x] 
+	// If a structure was active in the previous tick and a new token appears, form a higher-order ComposeBlock.
 	if ctx.LearnStruct {
 		if ctx.LastSens != "" && len(ctx.PrevStructSet) > 0 {
 			for base := range ctx.PrevStructSet {
@@ -1375,6 +1444,7 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 				if !ok {
 					continue
 				}
+				// avoid trivial compositions where x is already part of the base pair
 				if ctx.LastSens == a || ctx.LastSens == b {
 					continue
 				}
@@ -1384,11 +1454,13 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 					continue
 				}
 
+				// SeenComposes[ck] accumulates evidence for [base-x] composition.
 				ctx.SeenComposes[ck] += 0.28 * structBoost
 				if ctx.SeenComposes[ck] >= 1.0 {
 					name := fmt.Sprintf("[%s-%s]", base, ctx.LastSens)
 					id := "COMPOSE:" + name
 
+					// Crystallization point for a composed structure.
 					if _, exists := ctx.Blocks[id]; !exists {
 						ctx.AddBlock(NewComposeBlock(base, ctx.LastSens))
 						ctx.TrainEvents = append(ctx.TrainEvents, fmt.Sprintf("+++ LEARNED NEW COMPOSE BLOCK %s", name))
@@ -1404,7 +1476,8 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 		}
 	}
 
-	
+	//     4) Learn predictions (per-structure local transition statistics) 
+	// For each structure that was active in the previous tick, update its token transition weights.
 	if ctx.LearnPred {
 		if ctx.LastSens != "" && len(ctx.PrevStructSet) > 0 {
 			for st := range ctx.PrevStructSet {
@@ -1412,14 +1485,15 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 					ctx.TransCounts[st] = make(map[string]float64)
 				}
 
-				// base reinforcement (normal observation)
+				// Update transition weight for: st -> LastSens.
+				// When recent error boost is active, use a smaller step to avoid unstable overshoot.
 				learnRate := 0.22
 				if ctx.ErrTTL > 0 {
 					learnRate = 0.12
 				}
 				ctx.TransCounts[st][ctx.LastSens] += learnRate
 
-				
+				// Choose current best token prediction for this structure.
 				bestTok := ""
 				bestV := -1.0
 				sumV := 0.0
@@ -1441,6 +1515,9 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 				)
 				eps := 1e-9
 
+				// Confidence is gated by:
+				// -evidence amount (enough observations)
+				// -margin over the second-best token (avoid premature certainty)
 				computeGatedConf := func(targetTok string, targetV float64) float64 {
 					if sumV <= eps || targetTok == "" || targetV <= 0 {
 						return 0.0
@@ -1448,7 +1525,6 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 
 					rawConf := targetV / sumV
 
-					
 					minEvidenceForFull := float64(confirmN) * evidenceStep
 					eGate := 1.0
 					if minEvidenceForFull > eps {
@@ -1461,7 +1537,6 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 						}
 					}
 
-					
 					secondV := 0.0
 					for tok, v := range ctx.TransCounts[st] {
 						if tok == targetTok {
@@ -1488,7 +1563,7 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 
 					conf := rawConf * eGate * mGate
 
-					// hard caps: no "absolute certainty" look
+					// Avoid "absolute certainty" appearance.
 					if eGate < 1.0 || mGate < 1.0 {
 						if conf > 0.95 {
 							conf = 0.95
@@ -1514,22 +1589,23 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 					noPrev := oldPred == ""
 					sameAsPrev := bestTok == oldPred
 
-					
+					// Switching rule: don't oscillate on weak evidence.
+					// Allow change when the new candidate is strong enough and dominates the previous best.
 					domFactor := 1.35
 					if ctx.ErrTTL > 0 {
-						domFactor = 1.45 
+						domFactor = 1.45
 					}
 					canSwitchByStrength := (bestV >= PredSwitchMass) && (noPrev || bestV >= oldV*domFactor)
 
-					
+					// Error pressure override: after a misprediction, allow faster switching
+					// if the alternative is clearly stronger.
 					pressureOverride := false
 					if hadErrThisTick && !noPrev && !sameAsPrev {
-						
 						const (
-							overrideRatio = 1.80 
-							overrideAbs   = 0.60 
-							overrideMass  = 1.20 
-							minEvidence   = 0.88 
+							overrideRatio = 1.80
+							overrideAbs   = 0.60
+							overrideMass  = 1.20
+							minEvidence   = 0.88
 						)
 						if bestV >= overrideMass && bestV >= minEvidence && bestV >= oldV*overrideRatio && (bestV-oldV) >= overrideAbs {
 							pressureOverride = true
@@ -1542,7 +1618,7 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 						ctx.BestPred[st] = bestTok
 						ctx.PredConf[st] = computeGatedConf(bestTok, bestV)
 					} else {
-						
+						// Keep the previous prediction but slightly decay confidence.
 						ctx.BestPred[st] = oldPred
 						if oldPred != "" {
 							v := ctx.TransCounts[st][oldPred]
@@ -1553,7 +1629,7 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 						}
 					}
 				} else {
-					
+					// No stable candidate yet: keep previous prediction and decay confidence.
 					ctx.BestPred[st] = oldPred
 					ctx.PredConf[st] = oldConf * 0.92
 					if ctx.PredConf[st] < 0.01 {
@@ -1561,6 +1637,7 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 					}
 				}
 
+				// Optional event log for demo visibility.
 				if ctx.BestPred[st] != "" &&
 					(ctx.BestPred[st] != oldPred || (ctx.PredConf[st]-oldConf) > 0.15) {
 					if showPredEvents && !ctx.SuppressPredLog {
@@ -1574,8 +1651,6 @@ func Plasticity(ctx *Context, hadErrThisTick bool) {
 		}
 	}
 }
-
-
 
 func resetEpisodeBoundary(ctx *Context) {
 	
