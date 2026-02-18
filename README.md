@@ -255,3 +255,18 @@ This repository represents a compact, fully inspectable foundation for signal-dr
 ---
 
 See STB_paradigm.md for the formal definition of the computational paradigm.
+
+---
+
+## Additional STB Demos (independent validations)
+
+If you want to see other minimal demos that validate STB from different angles:
+
+- **STB Time + Planning Demo (stb-demo_2)** — a modular decision core where **WAIT acts as a planning operator** (VOI + learned causal effect), with **structural causal interventions (`do()`), counterfactuals, and deterministic replay**.  
+  https://github.com/Mukhameds/stb-demo_2
+
+- **STB-Lab (stb-demo_3)** — a minimal STB execution engine with **reproducible experiments**:
+  **E1** (branching stability / bounded queue), **E2** (plasticity under rule shift), **E3** (phantom bounded memory → behavior).  
+  https://github.com/Mukhameds/stb-demo_3
+
+---
